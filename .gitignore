@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights & outputs (large binary files)
+kle/image_predictor/models/saved/*.pt
+kle/image_predictor/models/saved/*.npz
+kle/image_predictor/models/*.pt
+kle/image_predictor/models/*.npz
+kle/image_predictor/models/*.joblib
+kle/image_predictor/output/*.png
+kle/image_predictor/output/*.jpg
+
+# Data (keep data.csv, ignore generated)
+*.xlsx
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.venv/
+venv/
