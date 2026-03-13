@@ -1,0 +1,3 @@
+PICK = 11
+TOTAL = 80
+DRAW_SIZE = 20
