@@ -785,6 +785,9 @@ def run_realistic_cover_backtest(
     random_trials: int,
     cover_sets_list: Sequence[int],
     seed: int,
+    print_picks: bool = False,
+    detail_n: int = 0,
+    print_hist: bool = True,
 ) -> None:
     """
     现实折中版覆盖回测：
@@ -803,6 +806,15 @@ def run_realistic_cover_backtest(
     if last_n <= 0 or last_n > max_eval:
         last_n = min(60, max_eval)
     start_test_idx = n_draws - last_n
+
+    cover_sets_list = sorted(list(set(int(x) for x in cover_sets_list if int(x) > 0)))
+    if not cover_sets_list:
+        raise ValueError("cover_sets_list 不能为空")
+
+    if detail_n <= 0:
+        detail_n = int(max(cover_sets_list))
+    if detail_n not in cover_sets_list:
+        detail_n = int(max(cover_sets_list))
 
     rng = np.random.default_rng(seed)
     rand_mean_hits: List[float] = []
@@ -831,6 +843,8 @@ def run_realistic_cover_backtest(
         rand_mean_hits.append(rand_mean)
 
         line_parts = []
+        detail_best_nums: List[int] = []
+        detail_best_hit = -1
         for n_sets in cover_sets_list:
             sets = generate_constrained_cover_sets(
                 weights=weights,
@@ -839,12 +853,19 @@ def run_realistic_cover_backtest(
                 random_seed=seed + test_idx + int(n_sets) * 11,
             )
             best_hit = 0
+            best_nums_local: List[int] = []
             for nums in sets:
                 h = len(set(nums) & actual)
                 if h > best_hit:
                     best_hit = h
+                    best_nums_local = list(nums)
             strategy_hits[int(n_sets)].append(best_hit)
-            line_parts.append(f"N={int(n_sets)}->{best_hit:>2d}")
+            mark = "🟢" if best_hit >= 10 else ("🔵" if best_hit >= 8 else "🟡" if best_hit >= 6 else "🔴")
+            line_parts.append(f"N={int(n_sets)}->{best_hit:>2d}{mark}")
+
+            if int(n_sets) == int(detail_n):
+                detail_best_nums = best_nums_local
+                detail_best_hit = best_hit
 
         issue = (
             df.iloc[test_idx][cfg.DATA_CONFIG["issue_col"]]
@@ -852,6 +873,18 @@ def run_realistic_cover_backtest(
             else test_idx
         )
         print(f"期号 {issue}: random≈{rand_mean:.2f} | " + ", ".join(line_parts))
+
+        if print_picks and detail_best_nums:
+            matched = sorted(set(detail_best_nums) & actual)
+            pred_s = " ".join(f"{x:02d}" for x in sorted(detail_best_nums))
+            act_s = " ".join(f"{x:02d}" for x in sorted(actual))
+            m_s = " ".join(f"{x:02d}" for x in matched) if matched else "(none)"
+            print(
+                f"   detail(N={detail_n}) hits={detail_best_hit:>2d} | "
+                f"Pred: {pred_s}"
+            )
+            print(f"   Actual: {act_s}")
+            print(f"   Match : {m_s}")
 
     print("-" * 80)
     print("覆盖策略汇总（按 uplift 排序）")
@@ -883,6 +916,12 @@ def run_realistic_cover_backtest(
             f"P>=10 {r['p_ge_10']:.3f}, max {r['max_hits']}, rand {r['rand_avg']:.3f}, "
             f"uplift {r['uplift']:+.3f}, CI [{r['ci_low']:+.3f}, {r['ci_high']:+.3f}]"
         )
+
+        if print_hist:
+            arr = np.asarray(strategy_hits[int(r["n_sets"])], dtype=int)
+            cnt = np.bincount(arr, minlength=DRAW_NUMBERS + 1)
+            pieces = [f"{h}:{int(cnt[h])}" for h in range(len(cnt)) if cnt[h] > 0]
+            print(f"   hist(N={int(r['n_sets'])}) -> " + ", ".join(pieces))
 
 def generate_tickets_from_scores(
     scores: np.ndarray,
@@ -1284,6 +1323,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="10,20,30,40",
         help="覆盖集合数量列表，逗号分隔（默认 10,20,30,40）",
     )
+    p_rcb.add_argument(
+        "--print-picks",
+        action="store_true",
+        help="逐期打印 detail_n 对应的预测号码、实际号码与命中号码",
+    )
+    p_rcb.add_argument(
+        "--detail-n",
+        type=int,
+        default=0,
+        help="逐期详细打印对应的 N（默认 0=自动取最大 N）",
+    )
+    p_rcb.add_argument(
+        "--no-hist",
+        action="store_true",
+        help="关闭汇总中的命中分布直方输出",
+    )
     p_rcb.add_argument("--seed", type=int, default=42, help="随机种子，默认 42")
 
     p_rff = sub.add_parser(
@@ -1363,6 +1418,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             random_trials=int(args.random_trials),
             cover_sets_list=_parse_int_list(str(args.cover_sets)),
             seed=int(args.seed),
+            print_picks=bool(args.print_picks),
+            detail_n=int(args.detail_n),
+            print_hist=not bool(args.no_hist),
         )
     elif args.command == "rf-backtest-fast":
         fast_rf_cfg = FastRFConfig(
