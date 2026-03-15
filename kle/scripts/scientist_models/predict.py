@@ -221,6 +221,29 @@ def cmd_walkforward(args):
         print(f'\nMemory saved to {save_path}')
 
 
+def cmd_meta(args):
+    from .meta_model import run_meta_pipeline
+    issues, draws = load_data(args.data)
+    run_meta_pipeline(
+        issues, draws, args.issue,
+        n_train=args.train, n_sets=args.sets,
+        extreme=args.extreme, pool_size=args.pool_size,
+    )
+
+
+def cmd_deepfuse(args):
+    from .deep_fusion import run_deep_fusion
+    issues, draws = load_data(args.data)
+    run_deep_fusion(
+        issues, draws, args.issue,
+        n_train=args.train, n_sets=args.sets,
+        extreme=args.extreme, pool_size=args.pool_size,
+        save_model=getattr(args, 'save_model', None),
+        load_model=getattr(args, 'load_model', None),
+        finetune=getattr(args, 'finetune', 8),
+    )
+
+
 def cmd_compare(args):
     issues, draws = load_data(args.data)
     idx = issues.index(args.issue)
@@ -237,6 +260,79 @@ def cmd_compare(args):
         h = len(set(nums) & actual)
         mark = '★' if h >= 5 else '●' if h >= 4 else ' '
         print(f'{mark} {name:<15} {h:>2}/{PICK}  {" ".join(f"{x:02d}" for x in nums)}')
+
+
+def cmd_pool_sweep(args):
+    """Sweep pool sizes to find minimum needed for 5+ hits (best set in pool)."""
+    print('Loading data...', flush=True)
+    issues, draws = load_data(args.data)
+    method_names = list(ALL_SIGNAL_PROVIDERS.keys())
+    idx = issues.index(args.issue)
+
+    pool_sizes = sorted(set(args.pool_sizes))
+    n_warmup = args.warmup
+    n_eval = args.eval
+
+    # Warmup memory
+    memory = MemoryBank(method_names)
+    for step in range(n_warmup):
+        t_idx = idx + n_eval + step
+        if t_idx >= len(draws) - 1:
+            break
+        t_hist = draws[t_idx + 1:]
+        t_actual = set(int(x) for x in draws[t_idx])
+        sc = {name: func(t_hist) for name, func in ALL_SIGNAL_PROVIDERS.items()}
+        memory.update_after_draw(sc, t_actual)
+
+    gen = GenerativeModel(memory)
+
+    # For each pool size: [draw -> best_hit_in_pool]
+    results = {ps: [] for ps in pool_sizes}
+
+    print(f'Pool size sweep: target 5+ hits (best set in pool)')
+    print(f'Issue anchor: {args.issue}, eval={n_eval} draws, warmup={n_warmup}')
+    print('=' * 70)
+
+    for step in range(n_eval):
+        t_idx = idx + n_eval - 1 - step
+        if t_idx >= len(draws) - 1:
+            break
+        t_hist = draws[t_idx + 1:]
+        t_actual = set(int(x) for x in draws[t_idx])
+        t_issue = issues[t_idx]
+
+        sc = {name: func(t_hist) for name, func in ALL_SIGNAL_PROVIDERS.items()}
+        fused = gen.compute_fused_distribution(sc, t_hist)
+
+        for pool_size in pool_sizes:
+            pool = gen.generate_mega_pool(sc, t_hist, pool_size=pool_size, seed_base=42 + t_idx)
+            best_hit = max(len(set(s) & t_actual) for s in pool)
+            results[pool_size].append(best_hit)
+
+        memory.update_after_draw(sc, t_actual)
+
+        # Progress
+        best_per_ps = [results[ps][-1] for ps in pool_sizes]
+        print(f'  {t_issue}: best_hits={best_per_ps}')
+
+    print('=' * 70)
+    print(f'{"Pool size":>12} | {"Avg best":>8} | {"Max":>4} | {"P>=5":>6} | {"P>=6":>6} | {"P>=7":>6}')
+    print('-' * 55)
+    for ps in pool_sizes:
+        arr = np.array(results[ps])
+        p5 = (arr >= 5).mean()
+        p6 = (arr >= 6).mean()
+        p7 = (arr >= 7).mean()
+        print(f'{ps:>12,} | {arr.mean():>8.2f} | {arr.max():>4d} | {p5:>6.2%} | {p6:>6.2%} | {p7:>6.2%}')
+
+    # Find minimum pool size for P(5+) >= target
+    target_p5 = args.target_p5
+    for ps in pool_sizes:
+        if (np.array(results[ps]) >= 5).mean() >= target_p5:
+            print(f'\n→ To achieve P(5+) >= {target_p5:.0%}: pool_size >= {ps:,}')
+            break
+    else:
+        print(f'\n→ No pool size in range achieved P(5+) >= {target_p5:.0%}')
 
 
 def main():
@@ -265,6 +361,42 @@ def main():
     p_cmp = sub.add_parser('compare', help='Compare all methods single-set')
     p_cmp.add_argument('--issue', required=True)
 
+    p_sweep = sub.add_parser('pool-sweep', help='Sweep pool sizes to find minimum for 5+ hits')
+    p_sweep.add_argument('--issue', required=True, help='Anchor issue (eval draws before it)')
+    p_sweep.add_argument('--eval', type=int, default=20, help='Number of draws to evaluate')
+    p_sweep.add_argument('--warmup', type=int, default=15, help='Warmup draws for memory')
+    p_sweep.add_argument('--pool-sizes', type=int, nargs='+',
+                        default=[5000, 10000, 20000, 50000, 100000, 200000],
+                        help='Pool sizes to test (default: 5k 10k 20k 50k 100k 200k)')
+    p_sweep.add_argument('--target-p5', type=float, default=0.5,
+                        help='Target P(5+) fraction to achieve (default 0.5)')
+
+    p_meta = sub.add_parser('meta', help='Meta-model: 12 methods as feature layers for learned generator')
+    p_meta.add_argument('--issue', required=True)
+    p_meta.add_argument('--sets', type=int, default=20)
+    p_meta.add_argument('--train', type=int, default=30, help='Training draws')
+    p_meta.add_argument('--extreme', action='store_true', help='Enable mega pool search')
+    p_meta.add_argument('--pool-size', type=int, default=50000)
+
+    p_deep = sub.add_parser('deepfuse', help='Deep Fusion: stacked cross-signal + agreement-biased generation')
+    p_deep.add_argument('--issue', required=True)
+    p_deep.add_argument('--sets', type=int, default=30)
+    p_deep.add_argument('--train', type=int, default=50, help='Training draws')
+    p_deep.add_argument('--extreme', action='store_true', help='Enable multi-strategy extreme generation')
+    p_deep.add_argument('--pool-size', type=int, default=80000)
+    p_deep.add_argument('--save-model', default=None, metavar='PATH',
+                        help='Save trained MLP weights to PATH.npz (e.g. models/2026063)')
+    p_deep.add_argument('--load-model', default=None, metavar='PATH',
+                        help='Load MLP weights from PATH.npz instead of retraining')
+    p_deep.add_argument('--finetune', type=int, default=8, metavar='N',
+                        help='Fine-tune on N most recent draws after loading (default 8, 0=off)')
+
+    p_deep10 = sub.add_parser('deepfuse10', help='Deep Fusion Extreme10: huge pool, focus on best-case 9+/10+ hits (no diversity filter)')
+    p_deep10.add_argument('--issue', required=True)
+    p_deep10.add_argument('--train', type=int, default=80, help='Training draws for fast MLP')
+    p_deep10.add_argument('--pool-size', type=int, default=300000, help='Total generated sets (approx)')
+    p_deep10.add_argument('--top', type=int, default=40, help='How many top sets to print')
+
     args = parser.parse_args()
     if args.command == 'predict':
         cmd_predict(args)
@@ -274,6 +406,19 @@ def main():
         cmd_walkforward(args)
     elif args.command == 'compare':
         cmd_compare(args)
+    elif args.command == 'pool-sweep':
+        cmd_pool_sweep(args)
+    elif args.command == 'meta':
+        cmd_meta(args)
+    elif args.command == 'deepfuse':
+        cmd_deepfuse(args)
+    elif args.command == 'deepfuse10':
+        from .deep_fusion import run_extreme10
+        issues, draws = load_data(args.data)
+        run_extreme10(
+            issues, draws, args.issue,
+            n_train=args.train, pool_size=args.pool_size, top=args.top,
+        )
     else:
         parser.print_help()
 
