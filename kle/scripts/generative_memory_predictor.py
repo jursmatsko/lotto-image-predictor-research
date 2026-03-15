@@ -8,15 +8,97 @@ Architecture:
   - GenerativeModel uses attention-weighted fusion + temperature sampling
   - Walk-forward: each draw updates memory, next draw uses updated memory
 
-Pick 11 numbers from 1-80 to match 20 drawn numbers.
+Pick 15 numbers from 1-80; target 11+ hits (matches in 20 drawn numbers).
+
+
+CLI Usage
+---------
+Run from the `kle` directory:  python scripts/generative_memory_predictor.py [OPTIONS]
+
+Options:
+  --predict-only       Fast prediction for next draw only (no walk-forward evaluation).
+  --target ISSUE       Target issue 期数 for walk-forward (e.g. 2026060). Default: 2026040
+  --n-cover N          Number of generated sets per run. Default: 20
+  --n-eval N            Number of draws in evaluation phase (walk-forward). Default: 20
+  --n-warmup N          Number of warmup draws before evaluation. Default: 15
+  --epochs N            Number of evaluation passes over the same n_eval draws (default 1). >1 refines memory.
+  --memory PATH         One file for load+save: load from PATH if exists, always save to PATH after run (keeps one persistent memory).
+  --save-memory PATH    Save memory state to .npz after run (e.g. storage/memory.npz).
+  --load-memory PATH    Load memory from .npz before prediction (for --predict-only).
+  --pick N              Number of numbers to predict per set (1-80). Default: 15
+
+Examples:
+  # Quick prediction for next draw (20 sets of 15 numbers)
+  python scripts/generative_memory_predictor.py --predict-only
+
+  # Predict next draw with 200 sets and 10 numbers per set
+  python scripts/generative_memory_predictor.py --predict-only --n-cover 200 --pick 10
+
+  # Walk-forward evaluation on issue 2026060, 20 cover sets
+  python scripts/generative_memory_predictor.py --target 2026060 --n-cover 20
+
+  # Walk-forward with 3 epochs (same 20 draws seen 3 times, memory refined each pass)
+  python scripts/generative_memory_predictor.py --target 2026060 --n-cover 20 --epochs 3 --save-memory storage/memory.npz
+
+  # Walk-forward with more evaluation draws and save memory after run
+  python scripts/generative_memory_predictor.py --target 2026060 --n-cover 200 --n-eval 30 --n-warmup 20 --save-memory storage/memory_2026060.npz
+
+  # Predict next draw using previously saved memory (e.g. after walk-forward)
+  python scripts/generative_memory_predictor.py --predict-only --load-memory storage/memory_2026060.npz --n-cover 50
+
+  # Predict for next issue (e.g. 2026063 when latest in data is 2026062)
+  python scripts/generative_memory_predictor.py --target 2026063 --n-cover 20
+
+  # Train on entire dataset (walk-forward over all draws, then save memory)
+  python scripts/generative_memory_predictor.py --full-dataset --n-cover 10 --save-memory storage/memory_full.npz
+
+  # Always use the SAME memory file (load if exists, update, save back) — one persistent state
+  python scripts/generative_memory_predictor.py --memory storage/memory.npz --target 2026060
+  python scripts/generative_memory_predictor.py --memory storage/memory.npz --target 2026062 --n-warmup 0
+  python scripts/generative_memory_predictor.py --memory storage/memory.npz --predict-only
+
+Continue training (resume from saved memory):
+  Load a checkpoint and run more walk-forward so memory is updated on newer draws. Use --n-warmup 0
+  to skip warmup when the loaded memory is already trained.
+  # First run: train up to 2026060 and save
+  python scripts/generative_memory_predictor.py --target 2026060 --save-memory storage/memory_2026060.npz
+  # Continue: load that memory, evaluate on 2026062 (more recent), save again
+  python scripts/generative_memory_predictor.py --target 2026062 --load-memory storage/memory_2026060.npz --n-warmup 0 --save-memory storage/memory_2026062.npz
+
+Saving weights to GitHub:
+  Memory files (--save-memory) are saved under kle/ when you use paths like storage/memory.npz.
+  kle/storage/*.npz is not gitignored, so you can commit and push them:
+    cd kle && python scripts/generative_memory_predictor.py --target 2026060 --save-memory storage/memory_2026060.npz
+    git add storage/memory_2026060.npz
+    git commit -m "Add memory weights for 2026060" && git push
+  For large or many files, use Git LFS or GitHub Releases instead of committing directly.
+
+Google Colab: save weights back to GitHub
+  Yes. Clone the repo, run training with --save-memory, then push using a GitHub Personal Access Token (PAT).
+  1. Create a PAT at GitHub → Settings → Developer settings → Personal access tokens (repo scope).
+  2. In a Colab cell, clone with the token so you can push later:
+       !git clone https://<YOUR_PAT>@github.com/<USER>/<REPO>.git
+       %cd <REPO>/kle
+  3. Install deps, run the script, save weights:
+       !pip install pandas numpy requests beautifulsoup4  # if needed
+       !python scripts/generative_memory_predictor.py --target 2026060 --save-memory storage/memory_2026060.npz
+  4. Push the new file back (use Colab secrets or a prompt for the token; don't hardcode):
+       !git config user.email "you@example.com"
+       !git config user.name "Your Name"
+       !git add storage/memory_2026060.npz
+       !git commit -m "Colab: memory weights 2026060"
+       !git push https://<YOUR_PAT>@github.com/<USER>/<REPO>.git HEAD
+     Or store PAT in Colab Secrets (e.g. GITHUB_TOKEN) and use: !git push https://$GITHUB_TOKEN@github.com/...
+  Using the same PAT in the clone URL and push URL avoids typing the token in the notebook.
 """
 import numpy as np
 from collections import defaultdict
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable
 import warnings
 warnings.filterwarnings('ignore')
 
-PICK = 11
+PICK = 15
+TARGET_MIN_HITS = 11
 TOTAL = 80
 DRAW_SIZE = 20
 
@@ -295,6 +377,42 @@ def sig_genetic_scores(hist, pop_sz=150, gens=100, window=60):
     return scores
 
 
+def sig_positional(hist, window=150):
+    """
+    Positional distribution: score each number by how often it appeared at each
+    draw position (红球_1..红球_20), with recent draws weighted more. Captures
+    "number X tends to appear at position K" to improve hit distribution.
+    """
+    if len(hist) < 10 or hist.ndim < 2 or hist.shape[1] < DRAW_SIZE:
+        return np.ones(TOTAL) / TOTAL
+    h = hist[:window]
+    n_draws, n_pos = h.shape[0], min(DRAW_SIZE, h.shape[1])
+    # count[position, number_idx]; time-decay so recent draws matter more
+    decay = np.exp(-0.015 * np.arange(n_draws))[::-1]
+    pos_counts = np.zeros((n_pos, TOTAL))
+    for t in range(n_draws):
+        for p in range(n_pos):
+            num = int(h[t, p])
+            if 1 <= num <= TOTAL:
+                pos_counts[p, num - 1] += decay[t]
+    # Per-position probs (smooth with pseudocount)
+    pos_probs = np.zeros((n_pos, TOTAL))
+    for p in range(n_pos):
+        tot = pos_counts[p].sum() + 1e-8
+        pos_probs[p] = (pos_counts[p] + 0.5) / (tot + 0.5 * TOTAL)
+    # Score each number: max over positions (strong at any position) + 0.3 * mean
+    scores = np.zeros(TOTAL)
+    for i in range(TOTAL):
+        by_pos = pos_probs[:, i]
+        scores[i] = 0.7 * by_pos.max() + 0.3 * by_pos.mean()
+    # Optional: boost numbers that appear in "hot" positions (recent high freq)
+    recent_pos = pos_counts[-min(30, n_draws):].sum(axis=0)
+    recent_pos = recent_pos / (recent_pos.max() + 1e-8)
+    scores = 0.75 * scores + 0.25 * recent_pos
+    scores = np.maximum(scores, 1e-8)
+    return scores
+
+
 ALL_SIGNAL_PROVIDERS = {
     'info_theory': sig_info_theory,
     'markov3': lambda h: sig_markov(h, 3),
@@ -302,12 +420,24 @@ ALL_SIGNAL_PROVIDERS = {
     'graph': sig_graph,
     'bayesian': sig_bayesian,
     'poisson': sig_poisson,
+    'positional': sig_positional,
     'svd': sig_svd,
     'ucb': sig_ucb,
     'fourier': sig_fourier,
     'knn': sig_knn,
     'recurrent': sig_recurrent,
     'genetic': sig_genetic_scores,
+}
+
+# Fast subset for --predict-only (skip genetic, recurrent, svd, fourier, knn)
+FAST_SIGNAL_PROVIDERS = {
+    'info_theory': sig_info_theory,
+    'markov3': lambda h: sig_markov(h, 3),
+    'graph': sig_graph,
+    'bayesian': sig_bayesian,
+    'poisson': sig_poisson,
+    'positional': sig_positional,
+    'ucb': sig_ucb,
 }
 
 
@@ -407,6 +537,51 @@ class MemoryBank:
                 self.replay_buffer.append((pset, actual, h))
             if len(self.replay_buffer) > self.max_replay:
                 self.replay_buffer = self.replay_buffer[-self.max_replay:]
+
+    def save(self, path: str) -> None:
+        """Save memory state to .npz (weights, attention, pair_success, replay)."""
+        replay_sets = np.zeros((len(self.replay_buffer), PICK), dtype=int)
+        replay_actual = np.zeros((len(self.replay_buffer), DRAW_SIZE), dtype=int)
+        replay_hits = np.zeros(len(self.replay_buffer), dtype=int)
+        for i, (pset, actual, h) in enumerate(self.replay_buffer):
+            p = (list(pset)[:PICK] + [0] * PICK)[:PICK]
+            replay_sets[i] = p
+            replay_actual[i] = sorted(actual)[:DRAW_SIZE]
+            replay_hits[i] = h
+        np.savez_compressed(
+            path,
+            method_weights=self.method_weights,
+            number_attention=self.number_attention,
+            pair_success=self.pair_success,
+            method_names=np.array(self.method_names, dtype=object),
+            replay_sets=replay_sets,
+            replay_actual=replay_actual,
+            replay_hits=replay_hits,
+            lr=np.array([self.lr]),
+            decay=np.array([self.decay]),
+        )
+
+    @staticmethod
+    def load(path: str, method_names: List[str]) -> "MemoryBank":
+        """Load memory state from .npz. method_names must match saved order."""
+        data = np.load(path, allow_pickle=True)
+        memory = MemoryBank(method_names, lr=float(data["lr"][0]), decay=float(data["decay"][0]))
+        saved_names = list(data["method_names"])
+        name_to_idx = {n: i for i, n in enumerate(saved_names)}
+        for i, name in enumerate(memory.method_names):
+            if name in name_to_idx:
+                j = name_to_idx[name]
+                memory.method_weights[i] = data["method_weights"][j]
+        memory.number_attention = data["number_attention"].copy()
+        memory.pair_success = data["pair_success"].copy()
+        memory.method_weights /= memory.method_weights.sum()
+        n_replay = len(data["replay_hits"])
+        memory.replay_buffer = []
+        for i in range(n_replay):
+            pset = list(int(x) for x in data["replay_sets"][i] if 1 <= x <= TOTAL)
+            actual = set(int(x) for x in data["replay_actual"][i] if 1 <= x <= TOTAL)
+            memory.replay_buffer.append((pset, actual, int(data["replay_hits"][i])))
+        return memory
 
     def get_method_weights(self) -> np.ndarray:
         return self.method_weights.copy()
@@ -545,6 +720,87 @@ class GenerativeModel:
 
 
 # ═══════════════════════════════════════════════════════════════
+# FULL-DATASET WALK-FORWARD (train on all draws)
+# ═══════════════════════════════════════════════════════════════
+
+def run_full_dataset_walk_forward(
+    issues,
+    draws,
+    n_cover: int = 20,
+    save_memory: str = '',
+    load_memory: str = '',
+    memory_lr: float = 0.15,
+    memory_decay: float = 0.92,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    min_history: int = 30,
+):
+    """
+    Train on the entire dataset with walk-forward: from oldest to newest,
+    at each draw use all past draws as history, update memory with the actual outcome.
+    Memory is updated once per draw (except the first min_history which are skipped
+    so signal providers have enough history).
+    """
+    n_draws = len(draws)
+    if n_draws < min_history + 1:
+        raise ValueError(f"Need at least {min_history + 1} draws; got {n_draws}")
+
+    method_names = list(ALL_SIGNAL_PROVIDERS.keys())
+    if load_memory:
+        memory = MemoryBank.load(load_memory, method_names)
+        gen = GenerativeModel(memory)
+        print(f'Loaded memory from {load_memory}; continuing full-dataset walk-forward')
+    else:
+        memory = MemoryBank(method_names, lr=memory_lr, decay=memory_decay)
+        gen = GenerativeModel(memory)
+        print('Full-dataset walk-forward (training on all draws)')
+
+    # Walk from oldest to newest: only update where history has >= min_history draws
+    # i from (n_draws-1-min_history) down to 0 => history = draws[i+1:] has length >= min_history
+    start_i = n_draws - 1 - min_history
+    if start_i < 0:
+        start_i = 0
+    total_steps = start_i + 1
+
+    print(f'Draws: {n_draws} total, updating memory on {total_steps} steps (from {issues[start_i]} to {issues[0]})')
+    print(f'COVER: {n_cover} sets per draw')
+    print('=' * 60)
+
+    rng = np.random.default_rng(42)
+    for step, i in enumerate(range(start_i, -1, -1)):
+        if progress_callback:
+            progress_callback('full_walk', step + 1, total_steps)
+        t_hist = draws[i + 1:]
+        t_actual = set(int(x) for x in draws[i])
+        t_issue = issues[i]
+
+        scores = {}
+        for name, func in ALL_SIGNAL_PROVIDERS.items():
+            scores[name] = func(t_hist)
+
+        fused = gen.compute_fused_distribution(scores, t_hist)
+        cover = gen.generate_sets(fused, n_sets=n_cover, seed=42 + i)
+        memory.update_after_draw(scores, t_actual, predicted_sets=cover)
+
+        if (step + 1) % 100 == 0 or step == 0 or step == total_steps - 1:
+            cover_hits = [len(set(s) & t_actual) for s in cover]
+            best_h = max(cover_hits)
+            print(f'  {t_issue} (step {step + 1}/{total_steps})  cover_best={best_h}/{PICK}')
+
+    print('=' * 60)
+    print(f'Done: memory updated on {total_steps} draws.')
+    print('Final memory weights (top 5):')
+    w = memory.method_weights
+    idx = np.argsort(w)[::-1][:5]
+    for j in idx:
+        print(f'  {method_names[j]:<15} {w[j]:.4f}')
+
+    if save_memory:
+        memory.save(save_memory)
+        print(f'Memory saved to {save_memory}')
+    return memory, gen
+
+
+# ═══════════════════════════════════════════════════════════════
 # MAIN: Walk-forward with memory
 # ═══════════════════════════════════════════════════════════════
 
@@ -559,13 +815,57 @@ def load_data(csv_path):
 
 def run_walk_forward_with_memory(
     issues, draws, target_issue, n_eval=20, n_warmup=10, n_cover=20,
+    save_memory: str = '', load_memory: str = '', epochs: int = 1,
+    memory_lr: float = 0.15, memory_decay: float = 0.92,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
 ):
     """
     Walk-forward evaluation with memory:
-    1. Warm up memory on n_warmup draws before evaluation window
-    2. Evaluate on n_eval draws, updating memory after each
+    1. (Optional) Load existing memory from load_memory path (continue training).
+    2. Warm up memory on n_warmup draws before evaluation window (use n_warmup=0 when resuming).
+    3. Run evaluation for epochs: each epoch runs over n_eval draws, updating memory (same draws, multiple passes).
+    4. Summary and final prediction use the state after the last epoch.
+
+    If target_issue is not in the data but is the next issue after the latest,
+    runs prediction-only for that draw (no evaluation).
     """
-    idx = issues.index(target_issue)
+    try:
+        idx = issues.index(target_issue)
+    except ValueError:
+        latest = issues[0]
+        try:
+            if int(target_issue) == int(latest) + 1:
+                # Predict for next draw (no actuals yet)
+                print(f'TARGET {target_issue} is the next draw after latest data ({latest}).')
+                print('Running prediction-only for this draw (no evaluation).')
+                print('=' * 80)
+                method_names = list(ALL_SIGNAL_PROVIDERS.keys())
+                if load_memory:
+                    memory = MemoryBank.load(load_memory, method_names)
+                    print(f'Memory loaded from {load_memory}')
+                else:
+                    memory = MemoryBank(method_names, lr=memory_lr, decay=memory_decay)
+                gen = GenerativeModel(memory)
+                hist = draws
+                final_scores = {}
+                for name, func in ALL_SIGNAL_PROVIDERS.items():
+                    final_scores[name] = func(hist)
+                fused_final = gen.compute_fused_distribution(final_scores, hist)
+                final_sets = gen.generate_sets(fused_final, n_sets=n_cover, seed=9999)
+                top15 = sorted(int(x) + 1 for x in np.argsort(fused_final)[::-1][:PICK])
+                print(f'\nPrediction for {target_issue} (target {TARGET_MIN_HITS}+ hits)')
+                print(f'Top {PICK}: {top15}')
+                print(f'\n{n_cover} generated sets:')
+                for i, s in enumerate(final_sets, 1):
+                    print(f'  SET_{i:02d}: {" ".join(f"{x:02d}" for x in sorted(s))}')
+                return memory, gen, None
+        except (ValueError, TypeError):
+            pass
+        raise ValueError(
+            f"Target issue '{target_issue}' not in data. "
+            f"Latest issue is '{latest}'. Use --target {latest} for evaluation, "
+            "or --predict-only for next-draw prediction."
+        )
     total_window = n_warmup + n_eval
 
     if idx + total_window >= len(draws):
@@ -573,17 +873,24 @@ def run_walk_forward_with_memory(
         n_eval = min(n_eval, total_window - n_warmup)
 
     method_names = list(ALL_SIGNAL_PROVIDERS.keys())
-    memory = MemoryBank(method_names)
-    gen = GenerativeModel(memory)
+    if load_memory:
+        memory = MemoryBank.load(load_memory, method_names)
+        gen = GenerativeModel(memory)
+        print(f'Resuming from {load_memory} (continue training)')
+    else:
+        memory = MemoryBank(method_names, lr=memory_lr, decay=memory_decay)
+        gen = GenerativeModel(memory)
 
     print(f'TARGET: {target_issue}')
-    print(f'WARMUP: {n_warmup} draws, EVAL: {n_eval} draws')
+    print(f'WARMUP: {n_warmup} draws, EVAL: {n_eval} draws x {epochs} epoch(s)')
     print(f'COVER: {n_cover} sets per draw')
     print('=' * 80)
 
     # Phase 1: Warmup (update memory without evaluation)
     print('\n--- WARMUP PHASE ---')
     for step in range(n_warmup):
+        if progress_callback:
+            progress_callback('warmup', step + 1, n_warmup)
         t_idx = idx + n_eval + step  # older draws
         t_hist = draws[t_idx + 1:]
         t_actual = set(int(x) for x in draws[t_idx])
@@ -600,64 +907,71 @@ def run_walk_forward_with_memory(
     for i, name in enumerate(method_names):
         print(f'  {name:<15} {memory.method_weights[i]:.4f}')
 
-    # Phase 2: Evaluation with memory
-    print('\n--- EVALUATION PHASE (with memory) ---')
+    # Phase 2: Evaluation with memory (repeat for epochs)
     eval_results = {'single': [], 'cover_best': [], 'cover_all': []}
     random_results = []
     rng = np.random.default_rng(42)
 
-    for step in range(n_eval):
-        t_idx = idx + n_eval - 1 - step  # newest to oldest within eval window
-        t_hist = draws[t_idx + 1:]
-        t_actual = set(int(x) for x in draws[t_idx])
-        t_issue = issues[t_idx]
+    for epoch in range(epochs):
+        if progress_callback:
+            progress_callback('eval_epoch', epoch + 1, epochs)
+        print(f'\n--- EVALUATION PHASE (epoch {epoch + 1}/{epochs}) ---')
+        eval_results = {'single': [], 'cover_best': [], 'cover_all': []}
+        random_results = []
+        verbose = (epoch == epochs - 1)  # per-step print only on last epoch
 
-        # Get all method scores
-        scores = {}
-        for name, func in ALL_SIGNAL_PROVIDERS.items():
-            scores[name] = func(t_hist)
+        for step in range(n_eval):
+            if progress_callback:
+                progress_callback('eval_step', step + 1, n_eval)
+            t_idx = idx + n_eval - 1 - step  # newest to oldest within eval window
+            t_hist = draws[t_idx + 1:]
+            t_actual = set(int(x) for x in draws[t_idx])
+            t_issue = issues[t_idx]
 
-        # Generate fused distribution
-        fused = gen.compute_fused_distribution(scores, t_hist)
+            scores = {}
+            for name, func in ALL_SIGNAL_PROVIDERS.items():
+                scores[name] = func(t_hist)
 
-        # Single best set (top-PICK)
-        single = sorted(int(x) + 1 for x in np.argsort(fused)[::-1][:PICK])
-        single_hits = len(set(single) & t_actual)
+            fused = gen.compute_fused_distribution(scores, t_hist)
 
-        # Cover sets
-        cover = gen.generate_sets(fused, n_sets=n_cover, seed=42 + t_idx)
-        cover_hits = [len(set(s) & t_actual) for s in cover]
-        best_cover_h = max(cover_hits)
+            single = sorted(int(x) + 1 for x in np.argsort(fused)[::-1][:PICK])
+            single_hits = len(set(single) & t_actual)
 
-        eval_results['single'].append(single_hits)
-        eval_results['cover_best'].append(best_cover_h)
-        eval_results['cover_all'].append(cover_hits)
+            cover = gen.generate_sets(fused, n_sets=n_cover, seed=42 + epoch * n_eval + t_idx)
+            cover_hits = [len(set(s) & t_actual) for s in cover]
+            best_cover_h = max(cover_hits)
 
-        # Random baseline (best of n_cover)
-        rand_best = max(
-            len(set(rng.choice(np.arange(1, 81), PICK, replace=False)) & t_actual)
-            for _ in range(n_cover)
-        )
-        random_results.append(rand_best)
+            eval_results['single'].append(single_hits)
+            eval_results['cover_best'].append(best_cover_h)
+            eval_results['cover_all'].append(cover_hits)
 
-        # Update memory with this draw's results
-        memory.update_after_draw(scores, t_actual, predicted_sets=cover)
-
-        matched = sorted(set(single) & t_actual)
-        best_set = cover[np.argmax(cover_hits)]
-        best_matched = sorted(set(best_set) & t_actual)
-
-        print(
-            f'  {t_issue}: single={single_hits}/{PICK} '
-            f'cover_best={best_cover_h}/{PICK} '
-            f'rand_best={rand_best} '
-            f'| single_match={matched}'
-        )
-        if best_cover_h >= 6:
-            print(
-                f'    ★ cover_best_set: {" ".join(f"{x:02d}" for x in sorted(best_set))} '
-                f'match={best_matched}'
+            rand_best = max(
+                len(set(rng.choice(np.arange(1, 81), PICK, replace=False)) & t_actual)
+                for _ in range(n_cover)
             )
+            random_results.append(rand_best)
+
+            memory.update_after_draw(scores, t_actual, predicted_sets=cover)
+
+            if verbose:
+                matched = sorted(set(single) & t_actual)
+                best_set = cover[np.argmax(cover_hits)]
+                best_matched = sorted(set(best_set) & t_actual)
+                print(
+                    f'  {t_issue}: single={single_hits}/{PICK} '
+                    f'cover_best={best_cover_h}/{PICK} '
+                    f'rand_best={rand_best} '
+                    f'| single_match={matched}'
+                )
+                if best_cover_h >= TARGET_MIN_HITS:
+                    print(
+                        f'    ★ cover_best_set: {" ".join(f"{x:02d}" for x in sorted(best_set))} '
+                        f'match={best_matched}'
+                    )
+        if not verbose and epochs > 1:
+            sa = np.array(eval_results['single'])
+            ca = np.array(eval_results['cover_best'])
+            print(f'  Epoch {epoch + 1}/{epochs}: single avg={sa.mean():.2f}, cover_best avg={ca.mean():.2f}')
 
     # Summary
     sa = np.array(eval_results['single'])
@@ -667,13 +981,13 @@ def run_walk_forward_with_memory(
     print('\n' + '=' * 80)
     print('SUMMARY')
     print('=' * 80)
-    print(f'{"Mode":<25} {"Avg":>6} {"Max":>4} {"P>=4":>6} {"P>=5":>6} {"P>=6":>6} {"P>=7":>6}')
+    print(f'{"Mode":<25} {"Avg":>6} {"Max":>4} {"P>=6":>6} {"P>=8":>6} {"P>=10":>6} {"P>=11":>6}')
     print('-' * 65)
     for label, arr in [('Single (memory)', sa), ('Cover best-of-20', ca), ('Random best-of-20', ra)]:
         print(
             f'{label:<25} {arr.mean():>6.2f} {arr.max():>4d} '
-            f'{(arr >= 4).mean():>6.2f} {(arr >= 5).mean():>6.2f} '
-            f'{(arr >= 6).mean():>6.2f} {(arr >= 7).mean():>6.2f}'
+            f'{(arr >= 6).mean():>6.2f} {(arr >= 8).mean():>6.2f} '
+            f'{(arr >= 10).mean():>6.2f} {(arr >= TARGET_MIN_HITS).mean():>6.2f}'
         )
 
     print(f'\nFinal memory weights:')
@@ -697,24 +1011,152 @@ def run_walk_forward_with_memory(
     actual_final = set(int(x) for x in draws[idx])
 
     print(f'\nTop {PICK} by fused score: {sorted(int(x)+1 for x in np.argsort(fused_final)[::-1][:PICK])}')
-    print(f'\n{n_cover} Generated Sets:')
+    print(f'\n{n_cover} Generated Sets (target {TARGET_MIN_HITS}+ hits):')
     final_hits = []
     for i, s in enumerate(final_sets, 1):
         h = len(set(s) & actual_final)
         final_hits.append(h)
         m = sorted(set(s) & actual_final)
-        mark = '★' if h >= 6 else '●' if h >= 5 else ' '
+        mark = '★' if h >= TARGET_MIN_HITS else '●' if h >= 8 else ' '
         print(f'{mark} SET_{i:02d}|hits={h:>2}/{PICK}|{" ".join(f"{x:02d}" for x in sorted(s))}  match={m}')
 
     fa = np.array(final_hits)
-    print(f'\nbest={fa.max()}, avg={fa.mean():.2f}, P>=5={(fa >= 5).mean():.2f}, P>=6={(fa >= 6).mean():.2f}')
+    print(f'\nbest={fa.max()}, avg={fa.mean():.2f}, P>=8={(fa >= 8).mean():.2f}, P>={TARGET_MIN_HITS}={(fa >= TARGET_MIN_HITS).mean():.2f}')
     print(f'ACTUAL: {" ".join(f"{x:02d}" for x in sorted(actual_final))}')
 
-    return memory, gen
+    if save_memory:
+        memory.save(save_memory)
+        print(f'\nMemory saved to {save_memory}')
+    metrics = {
+        'cover_best_mean': float(ca.mean()),
+        'cover_best_max': int(ca.max()),
+        'single_mean': float(sa.mean()),
+        'p_ge_8': float((ca >= 8).mean()),
+        'p_ge_11': float((ca >= TARGET_MIN_HITS).mean()),
+    }
+    return memory, gen, metrics
+
+
+def run_prediction_only(csv_path='data/data.csv', n_cover=20, save_memory: str = '', load_memory: str = ''):
+    """
+    Fast prediction for next draw: no walk-forward, just fuse signals and generate.
+    Uses latest issue in data; predicts the draw that would come after it.
+    If load_memory is set, loads that state instead of fresh memory.
+    """
+    issues, draws = load_data(csv_path)
+    latest_issue = issues[0]
+    hist = draws
+
+    method_names = list(FAST_SIGNAL_PROVIDERS.keys())
+    if load_memory:
+        memory = MemoryBank.load(load_memory, method_names)
+        gen = GenerativeModel(memory)
+        print(f'Memory loaded from {load_memory}')
+    else:
+        memory = MemoryBank(method_names)
+        gen = GenerativeModel(memory)
+
+    print(f'PREDICTION FOR NEXT DRAW (after {latest_issue})')
+    print('=' * 60)
+    print('Computing signals...')
+
+    scores = {}
+    for name, func in FAST_SIGNAL_PROVIDERS.items():
+        scores[name] = func(hist)
+
+    fused = gen.compute_fused_distribution(scores, hist)
+    top15 = sorted(int(x) + 1 for x in np.argsort(fused)[::-1][:PICK])
+    sets = gen.generate_sets(fused, n_sets=n_cover, seed=9999)
+
+    print(f'\nTop {PICK} by fused score (target {TARGET_MIN_HITS}+ hits): {top15}')
+    print(f'\n{n_cover} Generated Sets ({PICK} numbers each, target {TARGET_MIN_HITS}+ hits):')
+    for i, s in enumerate(sets, 1):
+        print(f'  SET_{i:02d}: {" ".join(f"{x:02d}" for x in sorted(s))}')
+    if save_memory:
+        memory.save(save_memory)
+        print(f'\nMemory saved to {save_memory}')
+    return top15, sets
+
+
+def _set_pick(n: int) -> None:
+    global PICK
+    PICK = n
 
 
 if __name__ == '__main__':
+    import argparse
+    _examples = """
+examples:
+  python scripts/generative_memory_predictor.py --predict-only
+  python scripts/generative_memory_predictor.py --predict-only --n-cover 200 --pick 10
+  python scripts/generative_memory_predictor.py --target 2026060 --n-cover 20
+  python scripts/generative_memory_predictor.py --target 2026060 --n-cover 20 --epochs 3 --save-memory storage/memory.npz
+  python scripts/generative_memory_predictor.py --target 2026060 --n-cover 200 --save-memory storage/memory.npz
+  python scripts/generative_memory_predictor.py --predict-only --load-memory storage/memory.npz --n-cover 50
+  python scripts/generative_memory_predictor.py --target 2026063 --n-cover 20
+  python scripts/generative_memory_predictor.py --target 2026062 --load-memory storage/memory.npz --n-warmup 0 --save-memory storage/memory_2026062.npz
+  python scripts/generative_memory_predictor.py --full-dataset --n-cover 10 --save-memory storage/memory_full.npz
+  python scripts/generative_memory_predictor.py --memory storage/memory.npz --target 2026060
+  python scripts/generative_memory_predictor.py --memory storage/memory.npz --predict-only
+
+Why different memory files? If you use different --save-memory paths per run (e.g. memory_2026060.npz, memory_2026062.npz)
+or omit --load-memory, each run starts or saves to a different file. Use --memory PATH to always load (if exists) and
+save to the same file so one memory state is updated across all runs.
+"""
+    parser = argparse.ArgumentParser(
+        description='Generative Memory-Augmented KL8 predictor (15 numbers, target 11+ hits).',
+        epilog=_examples,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('--predict-only', action='store_true', help='Fast prediction for next draw only (no walk-forward)')
+    parser.add_argument('--full-dataset', action='store_true', help='Train on entire dataset: walk-forward over all draws (oldest to newest)')
+    parser.add_argument('--target', default='2026040', help='Target issue 期数 for walk-forward (default: 2026040)')
+    parser.add_argument('--n-cover', type=int, default=20, help='Number of generated sets per run (default: 20)')
+    parser.add_argument('--n-eval', type=int, default=20, help='Evaluation draws in walk-forward (default: 20)')
+    parser.add_argument('--n-warmup', type=int, default=15, help='Warmup draws before evaluation (default: 15)')
+    parser.add_argument('--epochs', type=int, default=1, help='Evaluation passes over same draws; >1 refines memory (default: 1)')
+    parser.add_argument('--memory', type=str, default='', help='Single memory file: load from PATH if it exists, always save to PATH after run (use one file for all runs)')
+    parser.add_argument('--save-memory', type=str, default='', help='Save memory state to PATH after run (e.g. storage/memory.npz)')
+    parser.add_argument('--load-memory', type=str, default='', help='Load memory from PATH (predict-only or walk-forward to continue training)')
+    parser.add_argument('--memory-lr', type=float, default=0.15, help='MemoryBank learning rate (default: 0.15); tune with scripts/optimize_predictor.py')
+    parser.add_argument('--memory-decay', type=float, default=0.92, help='MemoryBank decay (default: 0.92)')
+    parser.add_argument('--pick', type=int, default=15, help='Numbers to predict per set, 1-80 (default: 15)')
+    parser.add_argument('--min-history', type=int, default=30, help='Min draws of history for --full-dataset (default: 30)')
+    args = parser.parse_args()
+
+    import os
+    DEFAULT_MEMORY_PATH = 'storage/memory.npz'
+    # One memory by default: use single file for load+save unless user set --load-memory/--save-memory
+    if args.memory:
+        if not args.load_memory:
+            args.load_memory = args.memory if os.path.isfile(args.memory) else ''
+        if not args.save_memory:
+            args.save_memory = args.memory
+    elif not args.load_memory and not args.save_memory:
+        args.load_memory = DEFAULT_MEMORY_PATH if os.path.isfile(DEFAULT_MEMORY_PATH) else ''
+        args.save_memory = DEFAULT_MEMORY_PATH
+
+    _set_pick(args.pick)
+
     csv_path = 'data/data.csv'
-    target = '2026040'
     issues, draws = load_data(csv_path)
-    run_walk_forward_with_memory(issues, draws, target, n_eval=20, n_warmup=15, n_cover=20)
+
+    if args.predict_only:
+        run_prediction_only(csv_path, n_cover=args.n_cover, save_memory=args.save_memory, load_memory=args.load_memory)
+    elif args.full_dataset:
+        run_full_dataset_walk_forward(
+            issues, draws,
+            n_cover=args.n_cover,
+            save_memory=args.save_memory,
+            load_memory=args.load_memory,
+            memory_lr=args.memory_lr,
+            memory_decay=args.memory_decay,
+            min_history=args.min_history,
+        )
+    else:
+        run_walk_forward_with_memory(
+            issues, draws, args.target,
+            n_eval=args.n_eval, n_warmup=args.n_warmup, n_cover=args.n_cover,
+            save_memory=args.save_memory, load_memory=args.load_memory,
+            epochs=args.epochs, memory_lr=args.memory_lr, memory_decay=args.memory_decay,
+        )
