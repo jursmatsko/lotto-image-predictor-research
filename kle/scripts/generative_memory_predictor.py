@@ -52,6 +52,9 @@ Examples:
   # Train on entire dataset (walk-forward over all draws, then save memory)
   python scripts/generative_memory_predictor.py --full-dataset --n-cover 10 --save-memory storage/memory_full.npz
 
+  # Train on latest 100 draws only (fast: 100 steps, no full history)
+  python scripts/generative_memory_predictor.py --latest 100 --n-cover 10 --memory storage/memory.npz
+
   # Always use the SAME memory file (load if exists, update, save back) — one persistent state
   python scripts/generative_memory_predictor.py --memory storage/memory.npz --target 2026060
   python scripts/generative_memory_predictor.py --memory storage/memory.npz --target 2026062 --n-warmup 0
@@ -94,6 +97,7 @@ Google Colab: save weights back to GitHub
 import numpy as np
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional, Callable
+import os
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -101,6 +105,57 @@ PICK = 15
 TARGET_MIN_HITS = 11
 TOTAL = 80
 DRAW_SIZE = 20
+
+# Payout tables for money/EV evaluation (must match the play type).
+# Note: these are research defaults; adjust to your official pay table if it changes.
+PAYOUT_TABLES = {
+    # 快乐8 选十 (stake=2). Historically: 5=3, 6=5, 7=80, 8=720, 9=8000, 10=jackpot.
+    "kl8_pick10": {
+        "pick": 10,
+        "stake": 2.0,
+        "refund0": True,
+        "prizes": {5: 3.0, 6: 5.0, 7: 80.0, 8: 720.0, 9: 8000.0, 10: 5000000.0},
+    },
+    "none": {"pick": None},
+}
+
+
+def compute_money_metrics(hit_hist: np.ndarray, payout_name: str) -> dict | None:
+    """
+    Compute money metrics for hit histogram using a named payout table.
+    Returns None if payout is 'none' or unavailable.
+    """
+    if payout_name not in PAYOUT_TABLES or payout_name == "none":
+        return None
+    table = PAYOUT_TABLES[payout_name]
+    stake = float(table["stake"])
+    prizes = dict(table["prizes"])
+    refund0 = bool(table.get("refund0", False))
+
+    total_tickets = int(hit_hist.sum())
+    investment = total_tickets * stake
+
+    total_prize = 0.0
+    if refund0:
+        total_prize += float(hit_hist[0]) * stake
+    for hits, prize in prizes.items():
+        if 0 <= int(hits) < len(hit_hist):
+            total_prize += float(hit_hist[int(hits)]) * float(prize)
+
+    net = total_prize - investment
+    ev_per_ticket = net / total_tickets if total_tickets else 0.0
+    roi = net / investment if investment else 0.0
+    return {
+        "stake": stake,
+        "investment": float(investment),
+        "total_prize": float(total_prize),
+        "net": float(net),
+        "ev_per_ticket": float(ev_per_ticket),
+        "roi": float(roi),
+        "refund0": refund0,
+        "prizes": prizes,
+        "total_tickets": total_tickets,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -468,9 +523,9 @@ class MemoryBank:
         # Per-method hit history for online weight update
         self.method_hit_history: Dict[str, List[float]] = {m: [] for m in method_names}
 
-        # Experience replay buffer: stores (predicted_set, actual_set, hits)
+        # Experience replay buffer: stores only strong patterns (predicted_set, actual_set, hits)
         self.replay_buffer: List[Tuple[List[int], set, int]] = []
-        self.max_replay = 200
+        self.max_replay = 500
 
         # Number co-occurrence memory: which pairs succeed together
         self.pair_success = np.zeros((TOTAL, TOTAL), dtype=float)
@@ -530,16 +585,24 @@ class MemoryBank:
                     self.pair_success[a - 1, b - 1] += 0.1
         self.pair_success *= 0.98
 
-        # 4) Experience replay
+        # 4) Experience replay: keep only high-hit patterns (>= replay_min_hits)
         if predicted_sets:
+            # Derive a reasonable default for how strong a pattern must be to enter replay.
+            # Use global TARGET_MIN_HITS when PICK is large (15), else a lower threshold.
+            min_for_replay = max(5, min(TARGET_MIN_HITS, PICK))
             for pset in predicted_sets:
                 h = len(set(pset) & actual)
-                self.replay_buffer.append((pset, actual, h))
+                if h >= min_for_replay:
+                    self.replay_buffer.append((pset, actual, h))
             if len(self.replay_buffer) > self.max_replay:
                 self.replay_buffer = self.replay_buffer[-self.max_replay:]
 
     def save(self, path: str) -> None:
         """Save memory state to .npz (weights, attention, pair_success, replay)."""
+        # Ensure parent directory exists (np.savez_compressed does not create it).
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         replay_sets = np.zeros((len(self.replay_buffer), PICK), dtype=int)
         replay_actual = np.zeros((len(self.replay_buffer), DRAW_SIZE), dtype=int)
         replay_hits = np.zeros(len(self.replay_buffer), dtype=int)
@@ -651,8 +714,17 @@ class GenerativeModel:
     4. Temperature-controlled sampling with diversity enforcement
     """
 
-    def __init__(self, memory: MemoryBank):
+    def __init__(
+        self,
+        memory: MemoryBank,
+        fusion_weights: Optional[Tuple[float, float, float, float]] = None,
+        temp_base: float = 1.0,
+        replay_min_hits: int = 4,
+    ):
         self.memory = memory
+        self.fusion_weights = fusion_weights or (0.45, 0.20, 0.15, 0.20)
+        self.temp_base = temp_base
+        self.replay_min_hits = replay_min_hits
 
     def compute_fused_distribution(
         self,
@@ -663,7 +735,9 @@ class GenerativeModel:
         weights = self.memory.get_method_weights()
         attention = self.memory.get_number_attention()
         pair_boost = self.memory.get_pair_boost()
-        replay_signal = ExperienceReplay.extract_success_pattern(self.memory)
+        replay_signal = ExperienceReplay.extract_success_pattern(
+            self.memory, min_hits=self.replay_min_hits
+        )
 
         # Normalize each method's scores to [0,1]
         normed = {}
@@ -678,15 +752,9 @@ class GenerativeModel:
             if name in normed:
                 fused += weights[i] * normed[name]
 
-        # Add memory signals
-        fused = (
-            0.45 * fused
-            + 0.20 * attention
-            + 0.15 * pair_boost
-            + 0.20 * replay_signal
-        )
+        fw, aw, pbw, rw = self.fusion_weights
+        fused = fw * fused + aw * attention + pbw * pair_boost + rw * replay_signal
 
-        # Final normalization
         fused = np.maximum(fused, 1e-8)
         return fused
 
@@ -700,10 +768,10 @@ class GenerativeModel:
         rng = np.random.default_rng(seed)
         usage = np.zeros(TOTAL)
         sets = []
-        temps = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5]
+        base_temps = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5]
+        temps = [self.temp_base * t for t in base_temps]
 
         for i in range(n_sets):
-            # Reduce probability for already-used numbers (diversity)
             adj = fused_dist / (1.0 + 0.35 * usage)
             temp = temps[i % len(temps)]
             logits = np.log(np.maximum(adj, 1e-12)) / temp
@@ -733,6 +801,11 @@ def run_full_dataset_walk_forward(
     memory_decay: float = 0.92,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
     min_history: int = 30,
+    fusion_weights: Optional[Tuple[float, float, float, float]] = None,
+    temp_base: float = 1.0,
+    replay_min_hits: int = 4,
+    checkpoint_every: int = 0,
+    fast_signals: bool = False,
 ):
     """
     Train on the entire dataset with walk-forward: from oldest to newest,
@@ -744,14 +817,25 @@ def run_full_dataset_walk_forward(
     if n_draws < min_history + 1:
         raise ValueError(f"Need at least {min_history + 1} draws; got {n_draws}")
 
-    method_names = list(ALL_SIGNAL_PROVIDERS.keys())
+    providers = FAST_SIGNAL_PROVIDERS if fast_signals else ALL_SIGNAL_PROVIDERS
+    method_names = list(providers.keys())
     if load_memory:
         memory = MemoryBank.load(load_memory, method_names)
-        gen = GenerativeModel(memory)
+        gen = GenerativeModel(
+            memory,
+            fusion_weights=fusion_weights,
+            temp_base=temp_base,
+            replay_min_hits=replay_min_hits,
+        )
         print(f'Loaded memory from {load_memory}; continuing full-dataset walk-forward')
     else:
         memory = MemoryBank(method_names, lr=memory_lr, decay=memory_decay)
-        gen = GenerativeModel(memory)
+        gen = GenerativeModel(
+            memory,
+            fusion_weights=fusion_weights,
+            temp_base=temp_base,
+            replay_min_hits=replay_min_hits,
+        )
         print('Full-dataset walk-forward (training on all draws)')
 
     # Walk from oldest to newest: only update where history has >= min_history draws
@@ -765,6 +849,7 @@ def run_full_dataset_walk_forward(
     print(f'COVER: {n_cover} sets per draw')
     print('=' * 60)
 
+    providers = FAST_SIGNAL_PROVIDERS if fast_signals else ALL_SIGNAL_PROVIDERS
     rng = np.random.default_rng(42)
     for step, i in enumerate(range(start_i, -1, -1)):
         if progress_callback:
@@ -774,12 +859,16 @@ def run_full_dataset_walk_forward(
         t_issue = issues[i]
 
         scores = {}
-        for name, func in ALL_SIGNAL_PROVIDERS.items():
+        for name, func in providers.items():
             scores[name] = func(t_hist)
 
         fused = gen.compute_fused_distribution(scores, t_hist)
         cover = gen.generate_sets(fused, n_sets=n_cover, seed=42 + i)
         memory.update_after_draw(scores, t_actual, predicted_sets=cover)
+
+        if save_memory and checkpoint_every > 0 and (step + 1) % checkpoint_every == 0:
+            memory.save(save_memory)
+            print(f'  [checkpoint] saved to {save_memory} after step {step + 1}/{total_steps}')
 
         if (step + 1) % 100 == 0 or step == 0 or step == total_steps - 1:
             cover_hits = [len(set(s) & t_actual) for s in cover]
@@ -806,11 +895,51 @@ def run_full_dataset_walk_forward(
 
 def load_data(csv_path):
     import pandas as pd
-    df = pd.read_csv(csv_path)
+    # Allow running from either repo root or the `kle/` directory.
+    # Try user-provided path first; otherwise fall back to `kle/data/data.csv` near this script.
+    path = csv_path
+    if not os.path.isfile(path):
+        here = os.path.dirname(__file__)  # .../kle/scripts
+        candidate = os.path.normpath(os.path.join(here, "..", "data", "data.csv"))
+        if os.path.isfile(candidate):
+            path = candidate
+    df = pd.read_csv(path)
     num_cols = [c for c in df.columns if c.startswith('红球')]
     issues = df['期数'].astype(str).tolist()
     draws = df[num_cols].to_numpy(dtype=int)
     return issues, draws
+
+
+def _parse_actual_csv(s: str) -> set[int]:
+    nums = []
+    for part in s.replace(" ", "").split(","):
+        if not part:
+            continue
+        nums.append(int(part))
+    actual = {n for n in nums if 1 <= n <= TOTAL}
+    return actual
+
+
+def _sigmoid(z: np.ndarray) -> np.ndarray:
+    z = np.clip(z, -50.0, 50.0)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def _fit_platt_scaling(x: np.ndarray, y: np.ndarray, steps: int = 250, lr: float = 0.2) -> tuple[float, float]:
+    """
+    Fit P(y=1|x) = sigmoid(a*x + b) with simple gradient descent.
+    x: (N,) fused scores; y: (N,) in {0,1} whether number hit.
+    """
+    a = 1.0
+    b = 0.0
+    for _ in range(steps):
+        p = _sigmoid(a * x + b)
+        # gradients of negative log-likelihood
+        da = np.mean((p - y) * x)
+        db = np.mean(p - y)
+        a -= lr * float(da)
+        b -= lr * float(db)
+    return float(a), float(b)
 
 
 def run_walk_forward_with_memory(
@@ -818,6 +947,14 @@ def run_walk_forward_with_memory(
     save_memory: str = '', load_memory: str = '', epochs: int = 1,
     memory_lr: float = 0.15, memory_decay: float = 0.92,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    fusion_weights: Optional[Tuple[float, float, float, float]] = None,
+    temp_base: float = 1.0,
+    replay_min_hits: int = 4,
+    sweep_pool: Optional[List[int]] = None,
+    hit_target: Optional[int] = None,
+    checkpoint_every: int = 0,
+    payout: str = "none",
+    fast_signals: bool = False,
 ):
     """
     Walk-forward evaluation with memory:
@@ -829,6 +966,7 @@ def run_walk_forward_with_memory(
     If target_issue is not in the data but is the next issue after the latest,
     runs prediction-only for that draw (no evaluation).
     """
+    ht = hit_target if hit_target is not None else TARGET_MIN_HITS
     try:
         idx = issues.index(target_issue)
     except ValueError:
@@ -845,7 +983,12 @@ def run_walk_forward_with_memory(
                     print(f'Memory loaded from {load_memory}')
                 else:
                     memory = MemoryBank(method_names, lr=memory_lr, decay=memory_decay)
-                gen = GenerativeModel(memory)
+                gen = GenerativeModel(
+                    memory,
+                    fusion_weights=fusion_weights,
+                    temp_base=temp_base,
+                    replay_min_hits=replay_min_hits,
+                )
                 hist = draws
                 final_scores = {}
                 for name, func in ALL_SIGNAL_PROVIDERS.items():
@@ -853,11 +996,21 @@ def run_walk_forward_with_memory(
                 fused_final = gen.compute_fused_distribution(final_scores, hist)
                 final_sets = gen.generate_sets(fused_final, n_sets=n_cover, seed=9999)
                 top15 = sorted(int(x) + 1 for x in np.argsort(fused_final)[::-1][:PICK])
+                top20 = set(int(x) + 1 for x in np.argsort(fused_final)[::-1][:20])
+                p = fused_final.astype(float)
+                p = p / p.sum()
                 print(f'\nPrediction for {target_issue} (target {TARGET_MIN_HITS}+ hits)')
                 print(f'Top {PICK}: {top15}')
+                print(f'Top 20 (estimated hit numbers): {sorted(top20)}')
                 print(f'\n{n_cover} generated sets:')
                 for i, s in enumerate(final_sets, 1):
-                    print(f'  SET_{i:02d}: {" ".join(f"{x:02d}" for x in sorted(s))}')
+                    ss = sorted(s)
+                    inter = sorted(set(ss) & top20)
+                    est_exp_hits = DRAW_SIZE * float(sum(p[x - 1] for x in ss))
+                    print(
+                        f'  SET_{i:02d}: {" ".join(f"{x:02d}" for x in ss)}'
+                        f'  | est_exp={est_exp_hits:.3f}  top20={len(inter):02d}  est={" ".join(f"{x:02d}" for x in inter)}'
+                    )
                 return memory, gen, None
         except (ValueError, TypeError):
             pass
@@ -872,14 +1025,25 @@ def run_walk_forward_with_memory(
         total_window = len(draws) - idx - 30
         n_eval = min(n_eval, total_window - n_warmup)
 
-    method_names = list(ALL_SIGNAL_PROVIDERS.keys())
+    providers = FAST_SIGNAL_PROVIDERS if fast_signals else ALL_SIGNAL_PROVIDERS
+    method_names = list(providers.keys())
     if load_memory:
         memory = MemoryBank.load(load_memory, method_names)
-        gen = GenerativeModel(memory)
+        gen = GenerativeModel(
+            memory,
+            fusion_weights=fusion_weights,
+            temp_base=temp_base,
+            replay_min_hits=replay_min_hits,
+        )
         print(f'Resuming from {load_memory} (continue training)')
     else:
         memory = MemoryBank(method_names, lr=memory_lr, decay=memory_decay)
-        gen = GenerativeModel(memory)
+        gen = GenerativeModel(
+            memory,
+            fusion_weights=fusion_weights,
+            temp_base=temp_base,
+            replay_min_hits=replay_min_hits,
+        )
 
     print(f'TARGET: {target_issue}')
     print(f'WARMUP: {n_warmup} draws, EVAL: {n_eval} draws x {epochs} epoch(s)')
@@ -896,7 +1060,7 @@ def run_walk_forward_with_memory(
         t_actual = set(int(x) for x in draws[t_idx])
 
         scores = {}
-        for name, func in ALL_SIGNAL_PROVIDERS.items():
+        for name, func in providers.items():
             scores[name] = func(t_hist)
 
         memory.update_after_draw(scores, t_actual)
@@ -911,6 +1075,7 @@ def run_walk_forward_with_memory(
     eval_results = {'single': [], 'cover_best': [], 'cover_all': []}
     random_results = []
     rng = np.random.default_rng(42)
+    signal_cache = {}  # step -> scores; reuse across epochs (~70% faster when epochs > 1)
 
     for epoch in range(epochs):
         if progress_callback:
@@ -928,9 +1093,13 @@ def run_walk_forward_with_memory(
             t_actual = set(int(x) for x in draws[t_idx])
             t_issue = issues[t_idx]
 
-            scores = {}
-            for name, func in ALL_SIGNAL_PROVIDERS.items():
-                scores[name] = func(t_hist)
+            if step not in signal_cache:
+                scores = {}
+                for name, func in providers.items():
+                    scores[name] = func(t_hist)
+                signal_cache[step] = scores
+            else:
+                scores = signal_cache[step]
 
             fused = gen.compute_fused_distribution(scores, t_hist)
 
@@ -953,17 +1122,30 @@ def run_walk_forward_with_memory(
 
             memory.update_after_draw(scores, t_actual, predicted_sets=cover)
 
+            global_step = epoch * n_eval + step
+            if save_memory and checkpoint_every > 0 and (global_step + 1) % checkpoint_every == 0:
+                memory.save(save_memory)
+                print(f'  [checkpoint] saved to {save_memory} after step {global_step + 1}')
+
             if verbose:
                 matched = sorted(set(single) & t_actual)
+                top20 = set(int(x) + 1 for x in np.argsort(fused)[::-1][:20])
+                p = fused.astype(float)
+                p = p / p.sum()
+                est_exp_hits = DRAW_SIZE * float(sum(p[x - 1] for x in single))
+                # For PICK=15, `single` is Top-15, so (single ∩ Top-20) is basically `single`.
+                # To avoid redundant output, report the Top-20 estimated numbers directly.
+                est_nums = sorted(top20)
                 best_set = cover[np.argmax(cover_hits)]
                 best_matched = sorted(set(best_set) & t_actual)
                 print(
                     f'  {t_issue}: single={single_hits}/{PICK} '
                     f'cover_best={best_cover_h}/{PICK} '
                     f'rand_best={rand_best} '
-                    f'| single_match={matched}'
+                    f'| single_match={matched} '
+                    f'| est_exp={est_exp_hits:.3f} top20=20 est={est_nums}'
                 )
-                if best_cover_h >= TARGET_MIN_HITS:
+                if best_cover_h >= ht:
                     print(
                         f'    ★ cover_best_set: {" ".join(f"{x:02d}" for x in sorted(best_set))} '
                         f'match={best_matched}'
@@ -977,18 +1159,33 @@ def run_walk_forward_with_memory(
     sa = np.array(eval_results['single'])
     ca = np.array(eval_results['cover_best'])
     ra = np.array(random_results)
+    cover_all = eval_results['cover_all']  # list of list of hits per set, per step
 
     print('\n' + '=' * 80)
     print('SUMMARY')
     print('=' * 80)
-    print(f'{"Mode":<25} {"Avg":>6} {"Max":>4} {"P>=6":>6} {"P>=8":>6} {"P>=10":>6} {"P>=11":>6}')
+    print(f'{"Mode":<25} {"Avg":>6} {"Max":>4} {"P>=6":>6} {"P>=8":>6} {"P>=10":>6} {"P>=" + str(ht):>6}')
     print('-' * 65)
-    for label, arr in [('Single (memory)', sa), ('Cover best-of-20', ca), ('Random best-of-20', ra)]:
+    for label, arr in [('Single (memory)', sa), (f'Cover best-of-{n_cover}', ca), (f'Random best-of-{n_cover}', ra)]:
         print(
             f'{label:<25} {arr.mean():>6.2f} {arr.max():>4d} '
             f'{(arr >= 6).mean():>6.2f} {(arr >= 8).mean():>6.2f} '
-            f'{(arr >= 10).mean():>6.2f} {(arr >= TARGET_MIN_HITS).mean():>6.2f}'
+            f'{(arr >= 10).mean():>6.2f} {(arr >= ht).mean():>6.2f}'
         )
+
+    if sweep_pool:
+        print('\n' + '=' * 80)
+        print(f'POOL SIZE SWEEP (target {ht}+ hits with PICK={PICK})')
+        print('=' * 80)
+        print(f'{"pool_size":>10} {"P>=" + str(ht):>8} {"mean_best":>10} {"max_best":>10}')
+        print('-' * 42)
+        for k in sorted(sweep_pool):
+            if k > n_cover:
+                continue
+            best_k = np.array([max(cover_all[step][:k]) for step in range(len(cover_all))])
+            p_ge = (best_k >= ht).mean()
+            print(f'{k:>10} {p_ge:>8.2%} {best_k.mean():>10.2f} {best_k.max():>10d}')
+        print('=' * 80)
 
     print(f'\nFinal memory weights:')
     for i, name in enumerate(method_names):
@@ -1003,41 +1200,98 @@ def run_walk_forward_with_memory(
 
     final_hist = draws[idx + 1:]
     final_scores = {}
-    for name, func in ALL_SIGNAL_PROVIDERS.items():
+    for name, func in providers.items():
         final_scores[name] = func(final_hist)
 
     fused_final = gen.compute_fused_distribution(final_scores, final_hist)
     final_sets = gen.generate_sets(fused_final, n_sets=n_cover, seed=9999)
     actual_final = set(int(x) for x in draws[idx])
+    top20 = set(int(x) + 1 for x in np.argsort(fused_final)[::-1][:20])
+    p = fused_final.astype(float)
+    p = p / p.sum()
 
     print(f'\nTop {PICK} by fused score: {sorted(int(x)+1 for x in np.argsort(fused_final)[::-1][:PICK])}')
-    print(f'\n{n_cover} Generated Sets (target {TARGET_MIN_HITS}+ hits):')
+    print(f'Top 20 (estimated hit numbers): {sorted(top20)}')
+    print(f'\n{n_cover} Generated Sets (target {ht}+ hits):')
     final_hits = []
     for i, s in enumerate(final_sets, 1):
         h = len(set(s) & actual_final)
         final_hits.append(h)
         m = sorted(set(s) & actual_final)
-        mark = '★' if h >= TARGET_MIN_HITS else '●' if h >= 8 else ' '
-        print(f'{mark} SET_{i:02d}|hits={h:>2}/{PICK}|{" ".join(f"{x:02d}" for x in sorted(s))}  match={m}')
+        inter = sorted(set(s) & top20)
+        est_exp_hits = DRAW_SIZE * float(sum(p[x - 1] for x in s))
+        mark = '★' if h >= ht else '●' if h >= 8 else ' '
+        print(
+            f'{mark} SET_{i:02d}|hits={h:>2}/{PICK}|{" ".join(f"{x:02d}" for x in sorted(s))}  match={m}'
+            f'  | est_exp={est_exp_hits:.3f}  top20={len(inter):02d}  est={inter}'
+        )
 
     fa = np.array(final_hits)
-    print(f'\nbest={fa.max()}, avg={fa.mean():.2f}, P>=8={(fa >= 8).mean():.2f}, P>={TARGET_MIN_HITS}={(fa >= TARGET_MIN_HITS).mean():.2f}')
+    print(f'\nbest={fa.max()}, avg={fa.mean():.2f}, P>=8={(fa >= 8).mean():.2f}, P>={ht}={(fa >= ht).mean():.2f}')
     print(f'ACTUAL: {" ".join(f"{x:02d}" for x in sorted(actual_final))}')
 
     if save_memory:
         memory.save(save_memory)
         print(f'\nMemory saved to {save_memory}')
+
+    # Money-based evaluation (only valid if payout table matches current PICK).
+    hit_hist = np.zeros(PICK + 1, dtype=int)
+    total_tickets = 0
+    for hits_step in cover_all:
+        for h in hits_step:
+            if 0 <= h <= PICK:
+                hit_hist[h] += 1
+                total_tickets += 1
+
+    money = None
+    if payout and payout != "none":
+        table = PAYOUT_TABLES.get(payout)
+        if table is None:
+            print(f"\n[MONEY METRICS] Unknown payout '{payout}'. Skipping money metrics.")
+        elif table.get("pick") != PICK:
+            print(
+                f"\n[MONEY METRICS] Payout '{payout}' is for pick={table.get('pick')}, "
+                f"but current --pick is {PICK}. Skipping money metrics."
+            )
+        else:
+            money = compute_money_metrics(hit_hist, payout)
+            assert money is not None
+            print(f"\nMONEY METRICS (cover pool, payout={payout}, pick={PICK}):")
+            print(f"  total tickets: {money['total_tickets']}")
+            print(f"  total investment (stake={money['stake']}): {money['investment']:.2f}")
+            print(f"  total prize: {money['total_prize']:.2f}")
+            print(f"  net profit: {money['net']:.2f}")
+            print(f"  EV per ticket: {money['ev_per_ticket']:.6f}")
+            print(f"  ROI: {money['roi'] * 100.0:.3f}%")
+
     metrics = {
         'cover_best_mean': float(ca.mean()),
         'cover_best_max': int(ca.max()),
         'single_mean': float(sa.mean()),
         'p_ge_8': float((ca >= 8).mean()),
         'p_ge_11': float((ca >= TARGET_MIN_HITS).mean()),
+        'ev_per_ticket': float(money["ev_per_ticket"]) if money else None,
+        'roi': float(money["roi"]) if money else None,
+        'hit_hist_0_pick': [int(x) for x in hit_hist.tolist()],
+        'total_tickets': int(total_tickets),
     }
     return memory, gen, metrics
 
 
-def run_prediction_only(csv_path='data/data.csv', n_cover=20, save_memory: str = '', load_memory: str = ''):
+def run_prediction_only(
+    csv_path='data/data.csv',
+    n_cover=20,
+    save_memory: str = '',
+    load_memory: str = '',
+    actual_csv: str = '',
+    calibrate_estimate: bool = False,
+    calib_n: int = 60,
+    consensus_runs: int = 0,
+    consensus_noise: float = 0.02,
+    consensus_temp: float = 1.0,
+    consensus_windows: str = "",
+    top_k_estimate: int = 20,
+):
     """
     Fast prediction for next draw: no walk-forward, just fuse signals and generate.
     Uses latest issue in data; predicts the draw that would come after it.
@@ -1068,10 +1322,105 @@ def run_prediction_only(csv_path='data/data.csv', n_cover=20, save_memory: str =
     top15 = sorted(int(x) + 1 for x in np.argsort(fused)[::-1][:PICK])
     sets = gen.generate_sets(fused, n_sets=n_cover, seed=9999)
 
+    # Estimation helpers (future draw: no actuals yet)
+    k_est = int(max(5, min(int(top_k_estimate), 40)))
+    top20 = set(int(x) + 1 for x in np.argsort(fused)[::-1][:k_est])
+    p = fused.astype(float)
+    p = p / p.sum()
+    top20_cal = None
+    if calibrate_estimate:
+        # Fit a simple calibrator from recent history:
+        # for each past draw i, use its own fused scores (from history after it) and label whether each number hit.
+        n = int(max(10, min(calib_n, len(draws) - 2)))
+        xs = []
+        ys = []
+        for i in range(n):
+            t_hist = draws[i + 1:]
+            t_actual = set(int(x) for x in draws[i])
+            t_scores = {}
+            for name, func in FAST_SIGNAL_PROVIDERS.items():
+                t_scores[name] = func(t_hist)
+            t_fused = gen.compute_fused_distribution(t_scores, t_hist)
+            xs.append(t_fused.astype(float))
+            y = np.zeros(TOTAL, dtype=float)
+            for num in t_actual:
+                if 1 <= num <= TOTAL:
+                    y[num - 1] = 1.0
+            ys.append(y)
+        x = np.concatenate(xs, axis=0)
+        y = np.concatenate(ys, axis=0)
+        a, b = _fit_platt_scaling(x, y)
+        p_hit = _sigmoid(a * fused.astype(float) + b)
+        top20_cal = set(int(x) + 1 for x in np.argsort(p_hit)[::-1][:k_est])
+
+    top20_consensus = None
+    if consensus_runs and consensus_runs > 0:
+        # Stability selection: sample many slightly-perturbed rankings and keep the most frequent Top-20 members.
+        # This can change the Top-20 in a meaningful way (unlike monotonic calibration).
+        rng = np.random.default_rng(2026)
+        eps = 1e-12
+        base_log = np.log(fused.astype(float) + eps) / float(max(1e-6, consensus_temp))
+        counts = np.zeros(TOTAL, dtype=int)
+        for _ in range(int(consensus_runs)):
+            noise = rng.normal(0.0, float(consensus_noise), size=TOTAL)
+            logits = base_log + noise
+            top = np.argsort(logits)[::-1][:k_est]
+            counts[top] += 1
+        top20_consensus = set(int(i) + 1 for i in np.argsort(counts)[::-1][:k_est])
+
+    top20_window_consensus = None
+    if consensus_windows:
+        # Consensus across multiple history window sizes (more impactful than small noise).
+        # Example: "30,60,120" means compute fused using last 30/60/120 draws and vote Top-20.
+        wins = [int(x.strip()) for x in consensus_windows.split(",") if x.strip()]
+        wins = [w for w in wins if w >= 5]
+        if wins:
+            counts = np.zeros(TOTAL, dtype=int)
+            for w in wins:
+                t_hist = draws[:w] if w < len(draws) else draws
+                t_scores = {}
+                for name, func in FAST_SIGNAL_PROVIDERS.items():
+                    t_scores[name] = func(t_hist)
+                t_fused = gen.compute_fused_distribution(t_scores, t_hist)
+                top = np.argsort(t_fused)[::-1][:k_est]
+                counts[top] += 1
+            top20_window_consensus = set(int(i) + 1 for i in np.argsort(counts)[::-1][:k_est])
+
     print(f'\nTop {PICK} by fused score (target {TARGET_MIN_HITS}+ hits): {top15}')
+    print(f'Top {k_est} (estimated hit numbers): {sorted(top20)}')
+    if top20_cal is not None:
+        print(f'Top {k_est} (calibrated estimate): {sorted(top20_cal)}')
+    if top20_consensus is not None:
+        print(
+            f'Top {k_est} (consensus estimate, runs={int(consensus_runs)}, noise={consensus_noise}, temp={consensus_temp}): '
+            f'{sorted(top20_consensus)}'
+        )
+    if top20_window_consensus is not None:
+        print(f'Top {k_est} (window-consensus estimate, windows={consensus_windows}): {sorted(top20_window_consensus)}')
     print(f'\n{n_cover} Generated Sets ({PICK} numbers each, target {TARGET_MIN_HITS}+ hits):')
     for i, s in enumerate(sets, 1):
-        print(f'  SET_{i:02d}: {" ".join(f"{x:02d}" for x in sorted(s))}')
+        ss = sorted(s)
+        inter = sorted(set(ss) & top20)
+        est_exp_hits = DRAW_SIZE * float(sum(p[x - 1] for x in ss))  # expected hits vs 20-number draw
+        print(
+            f'  SET_{i:02d}: {" ".join(f"{x:02d}" for x in ss)}'
+            f'  | est_exp={est_exp_hits:.3f}  top20={len(inter):02d}  est={" ".join(f"{x:02d}" for x in inter)}'
+        )
+
+    if actual_csv:
+        actual = _parse_actual_csv(actual_csv)
+        raw_match = sorted(actual & top20)
+        print('\nACTUAL (provided): ' + " ".join(f"{x:02d}" for x in sorted(actual)))
+        print(f'Raw Top{k_est} matches ({len(raw_match):02d}): ' + " ".join(f"{x:02d}" for x in raw_match))
+        if top20_cal is not None:
+            cal_match = sorted(actual & top20_cal)
+            print(f'Calibrated Top{k_est} matches ({len(cal_match):02d}): ' + " ".join(f"{x:02d}" for x in cal_match))
+        if top20_consensus is not None:
+            con_match = sorted(actual & top20_consensus)
+            print(f'Consensus Top{k_est} matches ({len(con_match):02d}): ' + " ".join(f"{x:02d}" for x in con_match))
+        if top20_window_consensus is not None:
+            wcon_match = sorted(actual & top20_window_consensus)
+            print(f'Window-consensus Top{k_est} matches ({len(wcon_match):02d}): ' + " ".join(f"{x:02d}" for x in wcon_match))
     if save_memory:
         memory.save(save_memory)
         print(f'\nMemory saved to {save_memory}')
@@ -1096,6 +1445,7 @@ examples:
   python scripts/generative_memory_predictor.py --target 2026063 --n-cover 20
   python scripts/generative_memory_predictor.py --target 2026062 --load-memory storage/memory.npz --n-warmup 0 --save-memory storage/memory_2026062.npz
   python scripts/generative_memory_predictor.py --full-dataset --n-cover 10 --save-memory storage/memory_full.npz
+  python scripts/generative_memory_predictor.py --latest 100 --n-cover 10 --memory storage/memory.npz
   python scripts/generative_memory_predictor.py --memory storage/memory.npz --target 2026060
   python scripts/generative_memory_predictor.py --memory storage/memory.npz --predict-only
 
@@ -1120,8 +1470,32 @@ save to the same file so one memory state is updated across all runs.
     parser.add_argument('--load-memory', type=str, default='', help='Load memory from PATH (predict-only or walk-forward to continue training)')
     parser.add_argument('--memory-lr', type=float, default=0.15, help='MemoryBank learning rate (default: 0.15); tune with scripts/optimize_predictor.py')
     parser.add_argument('--memory-decay', type=float, default=0.92, help='MemoryBank decay (default: 0.92)')
+    parser.add_argument('--pair-boost-weight', type=float, default=0.15, help='Fusion weight for pair_boost (default: 0.15); tune with optimize_predictor.py')
+    parser.add_argument('--replay-weight', type=float, default=0.20, help='Fusion weight for replay signal (default: 0.20)')
+    parser.add_argument('--temp-base', type=float, default=1.0, help='Temperature scale for generate_sets (default: 1.0)')
+    parser.add_argument('--replay-min-hits', type=int, default=4, help='Min hits for replay pattern (default: 4)')
     parser.add_argument('--pick', type=int, default=15, help='Numbers to predict per set, 1-80 (default: 15)')
     parser.add_argument('--min-history', type=int, default=30, help='Min draws of history for --full-dataset (default: 30)')
+    parser.add_argument('--latest', type=int, default=None, metavar='N', help='Train on latest N draws only (target=latest, n-eval=N, n-warmup=0; fast)')
+    parser.add_argument('--sweep-pool', type=str, default='', metavar='LIST', help='Pool sizes to report for hit rate, e.g. 10,20,50,100; use max as n-cover (default: off)')
+    parser.add_argument('--hit-target', type=int, default=None, metavar='N', help='Target min hits for summary and sweep (e.g. 7 for --pick 10; default: 11)')
+    parser.add_argument('--checkpoint-every', type=int, default=0, metavar='N', help='Save memory every N steps (0=only at end; use e.g. 25 to survive interrupts)')
+    parser.add_argument('--csv', type=str, default='data/data.csv', help='CSV path (default: data/data.csv; auto-falls back to kle/data/data.csv)')
+    parser.add_argument('--actual', type=str, default='', help='Actual numbers CSV for match check, e.g. "2,3,4,...,69"')
+    parser.add_argument('--calibrate-estimate', action='store_true', help='Calibrate Top-20 estimate using recent history (Platt scaling)')
+    parser.add_argument('--calib-n', type=int, default=60, help='How many recent draws to use for calibration (default: 60)')
+    parser.add_argument('--consensus-runs', type=int, default=0, help='Build consensus Top-20 from many noisy re-rankings (0=off)')
+    parser.add_argument('--consensus-noise', type=float, default=0.02, help='Noise std for consensus re-ranking (default: 0.02)')
+    parser.add_argument('--consensus-temp', type=float, default=1.0, help='Temperature applied in consensus ranking (default: 1.0)')
+    parser.add_argument('--consensus-windows', type=str, default='', help='Vote Top-20 across history windows, e.g. "30,60,120" (default: off)')
+    parser.add_argument('--top-k-estimate', type=int, default=20, help='How many numbers to output in estimated-hit list (default: 20)')
+    parser.add_argument(
+        '--payout',
+        type=str,
+        default='none',
+        choices=sorted(PAYOUT_TABLES.keys()),
+        help='Money metrics payout table (must match --pick). Use kl8_pick10 with --pick 10.',
+    )
     args = parser.parse_args()
 
     import os
@@ -1138,11 +1512,42 @@ save to the same file so one memory state is updated across all runs.
 
     _set_pick(args.pick)
 
-    csv_path = 'data/data.csv'
+    # Fusion weights: fused + attention(0.2) + pair_boost + replay = 1
+    att_w = 0.20
+    fused_w = 1.0 - att_w - args.pair_boost_weight - args.replay_weight
+    fused_w = max(0.25, min(0.65, fused_w))
+    total_w = fused_w + att_w + args.pair_boost_weight + args.replay_weight
+    fusion_weights = (fused_w / total_w, att_w / total_w, args.pair_boost_weight / total_w, args.replay_weight / total_w)
+
+    csv_path = args.csv
     issues, draws = load_data(csv_path)
 
+    if args.latest is not None:
+        args.target = issues[0]
+        args.n_eval = args.latest
+        args.n_warmup = 0
+
+    sweep_pool = None
+    if args.sweep_pool:
+        sweep_pool = [int(x.strip()) for x in args.sweep_pool.split(',') if x.strip()]
+        if sweep_pool:
+            args.n_cover = max(args.n_cover, max(sweep_pool))
+
     if args.predict_only:
-        run_prediction_only(csv_path, n_cover=args.n_cover, save_memory=args.save_memory, load_memory=args.load_memory)
+        run_prediction_only(
+            csv_path,
+            n_cover=args.n_cover,
+            save_memory=args.save_memory,
+            load_memory=args.load_memory,
+            actual_csv=args.actual,
+            calibrate_estimate=args.calibrate_estimate,
+            calib_n=args.calib_n,
+            consensus_runs=args.consensus_runs,
+            consensus_noise=args.consensus_noise,
+            consensus_temp=args.consensus_temp,
+            consensus_windows=args.consensus_windows,
+            top_k_estimate=args.top_k_estimate,
+        )
     elif args.full_dataset:
         run_full_dataset_walk_forward(
             issues, draws,
@@ -1152,6 +1557,10 @@ save to the same file so one memory state is updated across all runs.
             memory_lr=args.memory_lr,
             memory_decay=args.memory_decay,
             min_history=args.min_history,
+            fusion_weights=fusion_weights,
+            temp_base=args.temp_base,
+            replay_min_hits=args.replay_min_hits,
+            checkpoint_every=args.checkpoint_every,
         )
     else:
         run_walk_forward_with_memory(
@@ -1159,4 +1568,11 @@ save to the same file so one memory state is updated across all runs.
             n_eval=args.n_eval, n_warmup=args.n_warmup, n_cover=args.n_cover,
             save_memory=args.save_memory, load_memory=args.load_memory,
             epochs=args.epochs, memory_lr=args.memory_lr, memory_decay=args.memory_decay,
+            fusion_weights=fusion_weights,
+            temp_base=args.temp_base,
+            replay_min_hits=args.replay_min_hits,
+            sweep_pool=sweep_pool,
+            hit_target=args.hit_target,
+            checkpoint_every=args.checkpoint_every,
+            payout=args.payout,
         )

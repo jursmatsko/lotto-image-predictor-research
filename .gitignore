@@ -20,6 +20,15 @@ kle/image_predictor/models/*.joblib
 kle/image_predictor/output/*.png
 kle/image_predictor/output/*.jpg
 
+# KLE research artifacts (generated)
+kle/storage/
+kle/models/
+kle/predictions_*.txt
+kle/*.npz
+*.npz
+*.pt
+*.joblib
+
 # Data (keep data.csv, ignore generated)
 *.xlsx
 *.log
@@ -32,3 +41,6 @@ Thumbs.db
 .env
 .venv/
 venv/
+
+# Editor
+.cursor/
