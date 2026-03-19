@@ -151,3 +151,32 @@ python scripts/inspect_memory.py storage/memory_best.npz --brief
 ## 依赖
 
 - pandas, requests, beautifulsoup4, lxml
+
+
+## 1) Quick walk‑forward training for pick=11
+python scripts/generative_memory_predictor.py \
+  --target 2026060 \
+  --pick 11 \
+  --payout none \
+  --n-warmup 7 --n-eval 30 --n-cover 50 --epochs 1 \
+  --memory-lr 0.2588 --memory-decay 0.9436 \
+  --pair-boost-weight 0.1229 --replay-weight 0.1097 \
+  --temp-base 0.8674 --replay-min-hits 4 \
+  --save-memory storage/memory_pick11.npz
+This trains the same model architecture, but with 11 numbers per set. --payout none because we only have kl8_pick10 defined.
+
+## 2) Optimize hyperparameters for pick=11
+python -u scripts/optimize_predictor.py \
+  --n-trials 30 \
+  --pick 11 \
+  --payout none \
+  --objective ev \
+  --quick
+This will search best n_warmup/n_eval/memory_lr/... for pick=11.
+
+3) Predict with pick=11
+python scripts/generative_memory_predictor.py \
+  --predict-only \
+  --pick 11 \
+  --n-cover 200 \
+  --load-memory storage/memory_pick11.npz

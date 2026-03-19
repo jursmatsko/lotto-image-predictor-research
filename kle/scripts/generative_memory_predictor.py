@@ -763,15 +763,38 @@ class GenerativeModel:
         fused_dist: np.ndarray,
         n_sets: int = 20,
         seed: int = 42,
+        filter_top: int = 0,
+        overgen_factor: int = 5,
+        prioritize_8plus: bool = False,
+        payout_name: str = "none",
     ) -> List[List[int]]:
-        """Generate diverse cover sets from the fused distribution."""
+        """
+        Generate diverse cover sets from the fused distribution.
+
+        If filter_top > 0, over-generate (n_sets * overgen_factor) candidates and
+        keep the top n_sets by likelihood (or payout-weighted when prioritize_8plus).
+        prioritize_8plus: when True and payout=kl8_pick10, rank sets to favor 8+ hits
+        (boosts sets with 8+ numbers from fused top-20).
+        """
         rng = np.random.default_rng(seed)
         usage = np.zeros(TOTAL)
-        sets = []
+        sets: List[List[int]] = []
         base_temps = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5]
         temps = [self.temp_base * t for t in base_temps]
 
-        for i in range(n_sets):
+        # Normalise to probabilities for scoring.
+        p = fused_dist.astype(float)
+        p = np.maximum(p, 1e-12)
+        p = p / p.sum()
+
+        n_generate = int(n_sets)
+        do_filter = int(filter_top) > 0 or (prioritize_8plus and payout_name == "kl8_pick10" and PICK == 10)
+        if do_filter:
+            eff_filter = int(filter_top) if int(filter_top) > 0 else int(n_sets)
+            overgen = int(max(1, overgen_factor))
+            n_generate = eff_filter * overgen
+
+        for i in range(n_generate):
             adj = fused_dist / (1.0 + 0.35 * usage)
             temp = temps[i % len(temps)]
             logits = np.log(np.maximum(adj, 1e-12)) / temp
@@ -784,7 +807,37 @@ class GenerativeModel:
             for num in nums:
                 usage[num - 1] += 1
 
-        return sets
+        if not do_filter:
+            return sets
+
+        # Top-20 from fused dist (for 8+ boost)
+        top20 = set(int(x) + 1 for x in np.argsort(fused_dist)[::-1][:20])
+        use_8plus_boost = (
+            prioritize_8plus
+            and payout_name == "kl8_pick10"
+            and PICK == 10
+        )
+
+        # De-dup then keep best by score (higher = better).
+        unique: dict[tuple[int, ...], float] = {}
+        for s in sets:
+            key = tuple(s)
+            if key in unique:
+                continue
+            # Base score: sum log prob of chosen numbers.
+            score = 0.0
+            for x in key:
+                score += float(np.log(p[x - 1]))
+            # Payout-weighted boost for 8+ potential: sets with 8+ numbers in top-20
+            # rank much higher (8+ hits pays 720+ vs 80 for 7).
+            if use_8plus_boost:
+                top20_count = len(set(key) & top20)
+                score += 1000.0 * max(0, top20_count - 6)  # 7→+1000, 8→+2000, 9→+3000, 10→+4000
+            unique[key] = score
+
+        ranked = sorted(unique.items(), key=lambda kv: kv[1], reverse=True)
+        top = [list(k) for k, _ in ranked[: int(n_sets)]]
+        return top
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -806,6 +859,10 @@ def run_full_dataset_walk_forward(
     replay_min_hits: int = 4,
     checkpoint_every: int = 0,
     fast_signals: bool = False,
+    filter_top: int = 0,
+    overgen_factor: int = 5,
+    prioritize_8plus: bool = False,
+    payout_name: str = "none",
 ):
     """
     Train on the entire dataset with walk-forward: from oldest to newest,
@@ -863,7 +920,15 @@ def run_full_dataset_walk_forward(
             scores[name] = func(t_hist)
 
         fused = gen.compute_fused_distribution(scores, t_hist)
-        cover = gen.generate_sets(fused, n_sets=n_cover, seed=42 + i)
+        cover = gen.generate_sets(
+            fused,
+            n_sets=n_cover,
+            seed=42 + i,
+            filter_top=int(filter_top),
+            overgen_factor=int(overgen_factor),
+            prioritize_8plus=bool(prioritize_8plus),
+            payout_name=payout_name or "none",
+        )
         memory.update_after_draw(scores, t_actual, predicted_sets=cover)
 
         if save_memory and checkpoint_every > 0 and (step + 1) % checkpoint_every == 0:
@@ -955,6 +1020,10 @@ def run_walk_forward_with_memory(
     checkpoint_every: int = 0,
     payout: str = "none",
     fast_signals: bool = False,
+    filter_top: int = 0,
+    overgen_factor: int = 5,
+    prioritize_8plus: bool = False,
+    actual_csv: str = '',
 ):
     """
     Walk-forward evaluation with memory:
@@ -971,47 +1040,154 @@ def run_walk_forward_with_memory(
         idx = issues.index(target_issue)
     except ValueError:
         latest = issues[0]
+        # If target_issue is in the future but not present in data, we still run prediction-only using all available history.
+        use_future = False
+        try:
+            tgt_i = int(target_issue)
+            latest_i = int(latest)
+            use_future = tgt_i > latest_i
+        except (ValueError, TypeError):
+            use_future = False
+
         try:
             if int(target_issue) == int(latest) + 1:
-                # Predict for next draw (no actuals yet)
                 print(f'TARGET {target_issue} is the next draw after latest data ({latest}).')
                 print('Running prediction-only for this draw (no evaluation).')
                 print('=' * 80)
-                method_names = list(ALL_SIGNAL_PROVIDERS.keys())
-                if load_memory:
-                    memory = MemoryBank.load(load_memory, method_names)
-                    print(f'Memory loaded from {load_memory}')
-                else:
-                    memory = MemoryBank(method_names, lr=memory_lr, decay=memory_decay)
-                gen = GenerativeModel(
-                    memory,
-                    fusion_weights=fusion_weights,
-                    temp_base=temp_base,
-                    replay_min_hits=replay_min_hits,
+            elif use_future:
+                print(f'TARGET {target_issue} not found in data; using prediction-only with all available history.')
+                print(f'Latest in data is {latest}.')
+                print('=' * 80)
+            else:
+                raise ValueError("not-future")
+
+            method_names = list(ALL_SIGNAL_PROVIDERS.keys())
+            if load_memory:
+                memory = MemoryBank.load(load_memory, method_names)
+                print(f'Memory loaded from {load_memory}')
+            else:
+                memory = MemoryBank(method_names, lr=memory_lr, decay=memory_decay)
+            gen = GenerativeModel(
+                memory,
+                fusion_weights=fusion_weights,
+                temp_base=temp_base,
+                replay_min_hits=replay_min_hits,
+            )
+            hist = draws
+            final_scores = {}
+            for name, func in ALL_SIGNAL_PROVIDERS.items():
+                final_scores[name] = func(hist)
+            fused_final = gen.compute_fused_distribution(final_scores, hist)
+            final_sets = gen.generate_sets(
+                fused_final,
+                n_sets=n_cover,
+                seed=9999,
+                filter_top=int(filter_top),
+                overgen_factor=int(overgen_factor),
+                prioritize_8plus=bool(prioritize_8plus),
+                payout_name=payout or "none",
+            )
+            top15 = sorted(int(x) + 1 for x in np.argsort(fused_final)[::-1][:PICK])
+            top20 = set(int(x) + 1 for x in np.argsort(fused_final)[::-1][:20])
+            p = fused_final.astype(float)
+            p = p / p.sum()
+
+            print(f'\nPrediction for {target_issue} (target {TARGET_MIN_HITS}+ hits)')
+            print(f'Top {PICK}: {top15}')
+            print(f'Top 20 (estimated hit numbers): {sorted(top20)}')
+            print(f'\n{n_cover} generated sets:')
+            est_exp_hits_list: list[float] = []
+            sets_sorted_list: list[list[int]] = []
+            for i, s in enumerate(final_sets, 1):
+                ss = sorted(s)
+                inter = sorted(set(ss) & top20)
+                est_exp_hits = DRAW_SIZE * float(sum(p[x - 1] for x in ss))
+                est_exp_hits_list.append(float(est_exp_hits))
+                sets_sorted_list.append(list(ss))
+                print(
+                    f'  SET_{i:02d}: {" ".join(f"{x:02d}" for x in ss)}'
+                    f'  | est_exp={est_exp_hits:.3f}  top20={len(inter):02d}  est={" ".join(f"{x:02d}" for x in inter)}'
                 )
-                hist = draws
-                final_scores = {}
-                for name, func in ALL_SIGNAL_PROVIDERS.items():
-                    final_scores[name] = func(hist)
-                fused_final = gen.compute_fused_distribution(final_scores, hist)
-                final_sets = gen.generate_sets(fused_final, n_sets=n_cover, seed=9999)
-                top15 = sorted(int(x) + 1 for x in np.argsort(fused_final)[::-1][:PICK])
-                top20 = set(int(x) + 1 for x in np.argsort(fused_final)[::-1][:20])
-                p = fused_final.astype(float)
-                p = p / p.sum()
-                print(f'\nPrediction for {target_issue} (target {TARGET_MIN_HITS}+ hits)')
-                print(f'Top {PICK}: {top15}')
-                print(f'Top 20 (estimated hit numbers): {sorted(top20)}')
-                print(f'\n{n_cover} generated sets:')
-                for i, s in enumerate(final_sets, 1):
-                    ss = sorted(s)
-                    inter = sorted(set(ss) & top20)
-                    est_exp_hits = DRAW_SIZE * float(sum(p[x - 1] for x in ss))
+
+            # End-of-prediction summary (always) + realised hits summary (optional, if --actual is provided).
+            if est_exp_hits_list:
+                fa_est = np.array(est_exp_hits_list, dtype=float)
+                order_est = np.argsort(fa_est)[::-1]
+                top_k = min(10, len(order_est))
+                print('\n' + '=' * 80)
+                print('PREDICTION SUMMARY (estimate)')
+                print('=' * 80)
+                print(f'best est_exp={fa_est.max():.3f}, avg est_exp={fa_est.mean():.3f}')
+                print(f'top {top_k} sets by est_exp:')
+                for rank, j in enumerate(order_est[:top_k], start=1):
+                    s_nums = sets_sorted_list[j]
                     print(
-                        f'  SET_{i:02d}: {" ".join(f"{x:02d}" for x in ss)}'
-                        f'  | est_exp={est_exp_hits:.3f}  top20={len(inter):02d}  est={" ".join(f"{x:02d}" for x in inter)}'
+                        f'  {rank:02d}. SET_{j + 1:02d} est_exp={fa_est[j]:.3f}  nums='
+                        f'{" ".join(f"{x:02d}" for x in s_nums)}'
                     )
-                return memory, gen, None
+
+            if actual_csv:
+                actual = _parse_actual_csv(actual_csv)
+                if actual:
+                    hits_list = [len(set(ss) & actual) for ss in sets_sorted_list]
+                    hit_hist = np.zeros(PICK + 1, dtype=int)
+                    for h in hits_list:
+                        if 0 <= h <= PICK:
+                            hit_hist[h] += 1
+                    fa_hits = np.array(hits_list, dtype=int)
+                    print('\n' + '=' * 80)
+                    print('PREDICTION SUMMARY (realised hits; actual provided)')
+                    print('=' * 80)
+                    print('ACTUAL: ' + " ".join(f"{x:02d}" for x in sorted(actual)))
+                    nz = {h: int(c) for h, c in enumerate(hit_hist.tolist()) if c}
+                    print(f'hit_hist_0_to_{PICK}: {nz}')
+                    print(f'best hits={fa_hits.max()}, avg hits={fa_hits.mean():.2f}')
+                    order_hits = np.argsort(fa_hits)[::-1]
+                    top_k = min(10, len(order_hits))
+                    print(f'top {top_k} sets by realised hits:')
+                    for rank, j in enumerate(order_hits[:top_k], start=1):
+                        s_nums = sets_sorted_list[j]
+                        print(
+                            f'  {rank:02d}. SET_{j + 1:02d} hits={fa_hits[j]}  nums='
+                            f'{" ".join(f"{x:02d}" for x in s_nums)}'
+                        )
+
+                    # Optional money metrics if payout table matches current pick.
+                    if payout and payout != "none":
+                        table = PAYOUT_TABLES.get(payout)
+                        if table is None:
+                            print(f"\n[MONEY METRICS] Unknown payout '{payout}'. Skipping money metrics.")
+                        elif table.get("pick") != PICK:
+                            print(
+                                f"\n[MONEY METRICS] Payout '{payout}' is for pick={table.get('pick')}, "
+                                f"but current --pick is {PICK}. Skipping money metrics."
+                            )
+                        else:
+                            money_final = compute_money_metrics(hit_hist, payout)
+                            assert money_final is not None
+                            print(f"\nMONEY METRICS (final predicted sets only, payout={payout}, pick={PICK}):")
+                            print(f"  total tickets: {money_final['total_tickets']}")
+                            print(f"  total investment (stake={money_final['stake']}): {money_final['investment']:.2f}")
+                            print(f"  total prize: {money_final['total_prize']:.2f}")
+                            print(f"  net profit: {money_final['net']:.2f}")
+                            print(f"  EV per ticket: {money_final['ev_per_ticket']:.6f}")
+                            print(f"  ROI: {money_final['roi'] * 100.0:.3f}%")
+
+                            prizes = dict(table.get("prizes", {}))
+                            refund0 = bool(table.get("refund0", False))
+                            print("\nMONEY PER HIT (hits → count, prize each, subtotal):")
+                            for h in range(PICK, -1, -1):
+                                count = int(hit_hist[h])
+                                if h == 0 and refund0:
+                                    prize_each = float(money_final["stake"])
+                                else:
+                                    prize_each = float(prizes.get(h, 0.0))
+                                subtotal = count * prize_each
+                                print(
+                                    f"  {h:2d} hits → {count:6d}  x {prize_each:8.2f} = {subtotal:10.2f}"
+                                )
+
+            return memory, gen, None
         except (ValueError, TypeError):
             pass
         raise ValueError(
@@ -1106,7 +1282,15 @@ def run_walk_forward_with_memory(
             single = sorted(int(x) + 1 for x in np.argsort(fused)[::-1][:PICK])
             single_hits = len(set(single) & t_actual)
 
-            cover = gen.generate_sets(fused, n_sets=n_cover, seed=42 + epoch * n_eval + t_idx)
+            cover = gen.generate_sets(
+                fused,
+                n_sets=n_cover,
+                seed=42 + epoch * n_eval + t_idx,
+                filter_top=int(filter_top),
+                overgen_factor=int(overgen_factor),
+                prioritize_8plus=bool(prioritize_8plus),
+                payout_name=payout or "none",
+            )
             cover_hits = [len(set(s) & t_actual) for s in cover]
             best_cover_h = max(cover_hits)
 
@@ -1204,7 +1388,15 @@ def run_walk_forward_with_memory(
         final_scores[name] = func(final_hist)
 
     fused_final = gen.compute_fused_distribution(final_scores, final_hist)
-    final_sets = gen.generate_sets(fused_final, n_sets=n_cover, seed=9999)
+    final_sets = gen.generate_sets(
+        fused_final,
+        n_sets=n_cover,
+        seed=9999,
+        filter_top=int(filter_top),
+        overgen_factor=int(overgen_factor),
+        prioritize_8plus=bool(prioritize_8plus),
+        payout_name=payout or "none",
+    )
     actual_final = set(int(x) for x in draws[idx])
     top20 = set(int(x) + 1 for x in np.argsort(fused_final)[::-1][:20])
     p = fused_final.astype(float)
@@ -1229,6 +1421,24 @@ def run_walk_forward_with_memory(
     fa = np.array(final_hits)
     print(f'\nbest={fa.max()}, avg={fa.mean():.2f}, P>=8={(fa >= 8).mean():.2f}, P>={ht}={(fa >= ht).mean():.2f}')
     print(f'ACTUAL: {" ".join(f"{x:02d}" for x in sorted(actual_final))}')
+
+    # Histogram for the final predicted sets (the ones printed above).
+    final_hit_hist = np.zeros(PICK + 1, dtype=int)
+    for h in final_hits:
+        if 0 <= h <= PICK:
+            final_hit_hist[h] += 1
+
+    # Top 10 best prediction sets for the target issue (by realised hits).
+    if len(fa) > 0:
+        order = np.argsort(fa)[::-1]
+        top_k = min(10, len(order))
+        print('\nTop 10 best predictions (by hits):')
+        print(f'{"rank":>4} {"set_id":>6} {"hits":>6}  numbers')
+        print('-' * 40)
+        for rank, idx_best in enumerate(order[:top_k], start=1):
+            s = final_sets[idx_best]
+            h = fa[idx_best]
+            print(f'{rank:>4} SET_{idx_best + 1:02d} {h:>6}  {" ".join(f"{x:02d}" for x in sorted(s))}')
 
     if save_memory:
         memory.save(save_memory)
@@ -1264,6 +1474,40 @@ def run_walk_forward_with_memory(
             print(f"  EV per ticket: {money['ev_per_ticket']:.6f}")
             print(f"  ROI: {money['roi'] * 100.0:.3f}%")
 
+            # Detailed per-hit breakdown using payout table, including 0-hit refund.
+            print("\nMONEY PER HIT (hits → count, prize each, subtotal):")
+            prizes = dict(table.get("prizes", {}))
+            refund0 = bool(table.get("refund0", False))
+            for h in range(PICK, -1, -1):
+                count = int(hit_hist[h]) if 0 <= h < len(hit_hist) else 0
+                if h == 0 and refund0:
+                    prize_each = float(money["stake"])
+                else:
+                    prize_each = float(prizes.get(h, 0.0))
+                subtotal = count * prize_each
+                print(f"  {h:2d} hits → {count:6d}  x {prize_each:8.2f} = {subtotal:10.2f}")
+
+            # Also show money metrics for the FINAL predicted sets you printed above.
+            money_final = compute_money_metrics(final_hit_hist, payout)
+            assert money_final is not None
+            print(f"\nMONEY METRICS (final predicted sets only, payout={payout}, pick={PICK}):")
+            print(f"  total tickets: {money_final['total_tickets']}")
+            print(f"  total investment (stake={money_final['stake']}): {money_final['investment']:.2f}")
+            print(f"  total prize: {money_final['total_prize']:.2f}")
+            print(f"  net profit: {money_final['net']:.2f}")
+            print(f"  EV per ticket: {money_final['ev_per_ticket']:.6f}")
+            print(f"  ROI: {money_final['roi'] * 100.0:.3f}%")
+
+            print("\nMONEY PER HIT (final predicted sets only):")
+            for h in range(PICK, -1, -1):
+                count = int(final_hit_hist[h]) if 0 <= h < len(final_hit_hist) else 0
+                if h == 0 and refund0:
+                    prize_each = float(money_final["stake"])
+                else:
+                    prize_each = float(prizes.get(h, 0.0))
+                subtotal = count * prize_each
+                print(f"  {h:2d} hits → {count:6d}  x {prize_each:8.2f} = {subtotal:10.2f}")
+
     metrics = {
         'cover_best_mean': float(ca.mean()),
         'cover_best_max': int(ca.max()),
@@ -1291,6 +1535,10 @@ def run_prediction_only(
     consensus_temp: float = 1.0,
     consensus_windows: str = "",
     top_k_estimate: int = 20,
+    filter_top: int = 0,
+    overgen_factor: int = 5,
+    prioritize_8plus: bool = False,
+    payout_name: str = "none",
 ):
     """
     Fast prediction for next draw: no walk-forward, just fuse signals and generate.
@@ -1320,7 +1568,15 @@ def run_prediction_only(
 
     fused = gen.compute_fused_distribution(scores, hist)
     top15 = sorted(int(x) + 1 for x in np.argsort(fused)[::-1][:PICK])
-    sets = gen.generate_sets(fused, n_sets=n_cover, seed=9999)
+    sets = gen.generate_sets(
+        fused,
+        n_sets=n_cover,
+        seed=9999,
+        filter_top=int(filter_top),
+        overgen_factor=int(overgen_factor),
+        prioritize_8plus=prioritize_8plus,
+        payout_name=payout_name or "none",
+    )
 
     # Estimation helpers (future draw: no actuals yet)
     k_est = int(max(5, min(int(top_k_estimate), 40)))
@@ -1407,6 +1663,24 @@ def run_prediction_only(
             f'  | est_exp={est_exp_hits:.3f}  top20={len(inter):02d}  est={" ".join(f"{x:02d}" for x in inter)}'
         )
 
+    # End-of-prediction summary (estimate-only).
+    est_exp_vals = [DRAW_SIZE * float(sum(p[x - 1] for x in sorted(s))) for s in sets]
+    if est_exp_vals:
+        fa_est = np.array(est_exp_vals, dtype=float)
+        order_est = np.argsort(fa_est)[::-1]
+        top_k = min(10, len(order_est))
+        print('\n' + '=' * 80)
+        print('PREDICTION SUMMARY (estimate)')
+        print('=' * 80)
+        print(f'best est_exp={fa_est.max():.3f}, avg est_exp={fa_est.mean():.3f}')
+        print(f'top {top_k} sets by est_exp:')
+        for rank, j in enumerate(order_est[:top_k], start=1):
+            s_nums = sorted(sets[j])
+            print(
+                f'  {rank:02d}. SET_{j + 1:02d} est_exp={fa_est[j]:.3f}  nums='
+                f'{" ".join(f"{x:02d}" for x in s_nums)}'
+            )
+
     if actual_csv:
         actual = _parse_actual_csv(actual_csv)
         raw_match = sorted(actual & top20)
@@ -1421,6 +1695,29 @@ def run_prediction_only(
         if top20_window_consensus is not None:
             wcon_match = sorted(actual & top20_window_consensus)
             print(f'Window-consensus Top{k_est} matches ({len(wcon_match):02d}): ' + " ".join(f"{x:02d}" for x in wcon_match))
+
+        # Realised hits summary for the generated sets.
+        hits_list = [len(set(s) & actual) for s in sets]
+        hit_hist = np.zeros(PICK + 1, dtype=int)
+        for h in hits_list:
+            if 0 <= h <= PICK:
+                hit_hist[h] += 1
+        fa_hits = np.array(hits_list, dtype=int)
+        print('\n' + '=' * 80)
+        print('PREDICTION SUMMARY (realised hits; actual provided)')
+        print('=' * 80)
+        nz = {h: int(c) for h, c in enumerate(hit_hist.tolist()) if c}
+        print(f'hit_hist_0_to_{PICK}: {nz}')
+        print(f'best hits={fa_hits.max()}, avg hits={fa_hits.mean():.2f}')
+        order_hits = np.argsort(fa_hits)[::-1]
+        top_k = min(10, len(order_hits))
+        print(f'top {top_k} sets by realised hits:')
+        for rank, j in enumerate(order_hits[:top_k], start=1):
+            s_nums = sorted(sets[j])
+            print(
+                f'  {rank:02d}. SET_{j + 1:02d} hits={fa_hits[j]}  nums='
+                f'{" ".join(f"{x:02d}" for x in s_nums)}'
+            )
     if save_memory:
         memory.save(save_memory)
         print(f'\nMemory saved to {save_memory}')
@@ -1462,6 +1759,8 @@ save to the same file so one memory state is updated across all runs.
     parser.add_argument('--full-dataset', action='store_true', help='Train on entire dataset: walk-forward over all draws (oldest to newest)')
     parser.add_argument('--target', default='2026040', help='Target issue 期数 for walk-forward (default: 2026040)')
     parser.add_argument('--n-cover', type=int, default=20, help='Number of generated sets per run (default: 20)')
+    parser.add_argument('--filter-top', type=int, default=0, metavar='N', help='Over-generate then keep best N sets by fused likelihood (0=off). Use with --overgen-factor.')
+    parser.add_argument('--overgen-factor', type=int, default=5, metavar='K', help='When --filter-top is on, generate N*K candidates then keep best N (default: 5)')
     parser.add_argument('--n-eval', type=int, default=20, help='Evaluation draws in walk-forward (default: 20)')
     parser.add_argument('--n-warmup', type=int, default=15, help='Warmup draws before evaluation (default: 15)')
     parser.add_argument('--epochs', type=int, default=1, help='Evaluation passes over same draws; >1 refines memory (default: 1)')
@@ -1495,6 +1794,11 @@ save to the same file so one memory state is updated across all runs.
         default='none',
         choices=sorted(PAYOUT_TABLES.keys()),
         help='Money metrics payout table (must match --pick). Use kl8_pick10 with --pick 10.',
+    )
+    parser.add_argument(
+        '--prioritize-8plus',
+        action='store_true',
+        help='Rank sets by 8+ hit potential (payout-weighted). Use with --pick 10 --payout kl8_pick10 --filter-top.',
     )
     args = parser.parse_args()
 
@@ -1547,6 +1851,10 @@ save to the same file so one memory state is updated across all runs.
             consensus_temp=args.consensus_temp,
             consensus_windows=args.consensus_windows,
             top_k_estimate=args.top_k_estimate,
+            filter_top=args.filter_top,
+            overgen_factor=args.overgen_factor,
+            prioritize_8plus=args.prioritize_8plus,
+            payout_name=args.payout,
         )
     elif args.full_dataset:
         run_full_dataset_walk_forward(
@@ -1561,6 +1869,10 @@ save to the same file so one memory state is updated across all runs.
             temp_base=args.temp_base,
             replay_min_hits=args.replay_min_hits,
             checkpoint_every=args.checkpoint_every,
+            filter_top=args.filter_top,
+            overgen_factor=args.overgen_factor,
+            prioritize_8plus=args.prioritize_8plus,
+            payout_name=args.payout,
         )
     else:
         run_walk_forward_with_memory(
@@ -1575,4 +1887,8 @@ save to the same file so one memory state is updated across all runs.
             hit_target=args.hit_target,
             checkpoint_every=args.checkpoint_every,
             payout=args.payout,
+            filter_top=args.filter_top,
+            overgen_factor=args.overgen_factor,
+            prioritize_8plus=args.prioritize_8plus,
+            actual_csv=args.actual,
         )
